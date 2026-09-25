@@ -7,12 +7,16 @@ import-time dependency, must not touch the event loop, and must never raise into
 the agent. Every method swallows transport failures and returns a neutral
 value. A watch that is unreachable degrades the watch, never the agent.
 
-There are exactly two things the plugin can say to the adapter:
+There are exactly three things the plugin can say to the adapter:
 
 * ``post_event`` -- a lifecycle observation. Fire and forget.
 * ``ask`` -- "a human must decide this, tell me what the watch said". The HTTP
   request *is* the pending state: it stays open until the watch answers or the
   budget expires, so neither side needs a registry, a sweeper, or a callback.
+* ``notify`` -- push text to the wrist. Used by Hermes' own out-of-process
+  delivery hook (``standalone_sender_fn``), so ``hermes send``, a cron job and
+  the agent's send_message tool can reach a watch without a gateway adapter in
+  this process.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ import logging
 import urllib.error
 import urllib.request
 from typing import Any, Optional
+
+from .settings import PLATFORM_NAME
 
 log = logging.getLogger("hermes_watch.client")
 
@@ -42,6 +48,36 @@ class AdapterClient:
         self.token = token
 
     # -- plumbing ------------------------------------------------------------
+
+    def notify(self, text: str, *, device: str = "") -> dict:
+        """Push a notification to the watch, or to one device by label.
+
+        Returns a dict in the shape Hermes' ``standalone_sender_fn`` contract
+        expects, because that is its main caller:
+
+            {"success": True, "platform": "pixel_watch", "chat_id": ...,
+             "message_id": ...}
+            {"success": False, "platform": "pixel_watch", "error": ...}
+
+        Callers that are not Hermes (a script, a hook) can ignore the shape: what
+        matters is that a message either reached a watch or did not, and this
+        never claims delivery it cannot confirm.
+        """
+        platform = PLATFORM_NAME
+        clean = str(text or "").strip()
+        if not clean:
+            return {"success": False, "platform": platform, "chat_id": device,
+                    "error": "refusing to send an empty notification"}
+        response = self._request("POST", "/notify", {"text": clean, "device": device})
+        if not response or not response.get("ok"):
+            error = (response or {}).get("error") or "no watch listening on the listener"
+            return {"success": False, "platform": platform, "chat_id": device, "error": error}
+        return {
+            "success": True,
+            "platform": platform,
+            "chat_id": device or str(response.get("delivered_to") or ""),
+            "message_id": str(response.get("message_id") or ""),
+        }
 
     def _request(
         self,

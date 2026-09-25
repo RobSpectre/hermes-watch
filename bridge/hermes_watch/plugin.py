@@ -31,6 +31,7 @@ Hard rules honoured here, because this code runs inside a live agent turn:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import queue
 import threading
@@ -337,6 +338,44 @@ class WatchPlugin:
         )
 
 
+def _parse_target_ref(ref: str):
+    """Resolve a send target on this platform to a chat id.
+
+    A watch's identity *is* its label: the app's hello carries no device id (its
+    protocol is frozen and has nowhere to keep one), so the label is what the
+    listener keys on and what a caller names here. Any non-empty label parses;
+    whether a watch is actually listening is the adapter's business, and it
+    reports that honestly rather than accepting a message into the void.
+    """
+    label = str(ref or "").strip()
+    return (label, None) if label else None
+
+
+async def _standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[list] = None,
+    force_document: bool = False,
+) -> dict:
+    """Out-of-process delivery (``standalone_sender_fn`` contract).
+
+    Hermes calls this when the sending process is not the gateway: ``hermes
+    send`` from a script, a cron job's delivery, a tool call in another process.
+    The watch listener is part of the gateway, so the message is posted to its
+    loopback API and the gateway's adapter puts it on the socket. ``thread_id``
+    and ``media_files`` are signature parity only: a watch has no threads and
+    this listener takes text.
+    """
+    extra = getattr(pconfig, "extra", None) or {}
+    url = str(extra.get("url") or "") or watch_url()
+    token = str(extra.get("ingest_token") or "")
+    client = AdapterClient(url, token=token)
+    return await asyncio.to_thread(client.notify, message, device=chat_id or "")
+
+
 def _load_adapter(config: Any) -> Any:
     """Import the adapter only when the gateway actually asks for it.
 
@@ -428,6 +467,14 @@ def register(ctx: Any) -> None:  # noqa: D401 - Hermes plugin entry point
             env_enablement_fn=_env_enablement,
             allowed_users_env="HERMES_WATCH_ALLOWED_USERS",
             allow_all_env="HERMES_WATCH_ALLOW_ALL_USERS",
+            # Addressing and out-of-process delivery. Without a target parser,
+            # `hermes send -t pixel_watch:"Pixel Watch 4"` fails to resolve at
+            # all ("the plugin parser did not recognize it"); without the
+            # standalone sender it needs a gateway adapter in the same process,
+            # which a cron job or a plain script does not have.
+            parse_target_ref_fn=_parse_target_ref,
+            standalone_sender_fn=_standalone_send,
+            cron_deliver_env_var="HERMES_WATCH_HOME_CHANNEL",
             max_message_length=0,
             emoji="⌚",
             platform_hint=(

@@ -233,6 +233,7 @@ class HermesWatchAdapter(BasePlatformAdapter):
         app.router.add_get("/watch", self._handle_watch)
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_post("/event", self._handle_event)
+        app.router.add_post("/notify", self._handle_notify)
 
         self._runner = web.AppRunner(app)
         try:
@@ -620,6 +621,41 @@ class HermesWatchAdapter(BasePlatformAdapter):
                 "watches": [link.to_dict() for link in self._links.values()],
                 "pending": [pending.to_dict() for pending in self._pending.values()],
             }
+        )
+
+    async def _handle_notify(self, request: web.Request) -> web.Response:
+        """Push a notification to the watch, from anything on this host.
+
+        Hermes' own delivery path is ``adapter.send`` -- ``hermes send``, the
+        agent's send_message tool, cron ``deliver=pixel_watch``. This is the
+        out-of-process seam for everything that is *not* a gateway adapter: a
+        shell script, a hook, a systemd unit finishing a job. Same guards as
+        ``/event``: loopback only, and the optional shared secret when set.
+        """
+        if not self._caller_is_local(request):
+            return web.json_response({"ok": False, "error": "loopback only"}, status=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+        if isinstance(body, dict) and self._ingest_token:
+            supplied = str(body.get("token") or "")
+            if not secrets.compare_digest(supplied, self._ingest_token):
+                return web.json_response({"ok": False, "error": "bad token"}, status=403)
+
+        text = str((body.get("text") or "")).strip()
+        if not text:
+            return web.json_response({"ok": False, "error": "empty text"}, status=400)
+        device = str(body.get("device") or "").strip()
+        result = await self.send(device, text)
+        if not result.success:
+            # 503 so a caller (and cron) can tell "no watch listening" from a
+            # bad request. Nothing was delivered, and nothing was invented.
+            return web.json_response(
+                {"ok": False, "error": result.error or "delivery failed"}, status=503
+            )
+        return web.json_response(
+            {"ok": True, "message_id": result.message_id, "delivered_to": device or "all watches"}
         )
 
     async def _handle_event(self, request: web.Request) -> web.Response:

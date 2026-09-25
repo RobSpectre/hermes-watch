@@ -146,6 +146,10 @@ class WatchLinkService : Service() {
                 notifier.showQuestion(question)
             }
             Protocol.EVENT_QUESTION_RESOLVED -> notifier.clearQuestion()
+            Protocol.EVENT_MESSAGE -> {
+                val text = frame.payload?.get("text")?.toString()?.trim('"') ?: return
+                if (text.isNotBlank()) notifier.showMessage(text)
+            }
             else -> Unit // turn/tool/session churn is visible in the stats, not a notification
         }
     }

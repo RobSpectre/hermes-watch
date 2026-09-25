@@ -44,6 +44,16 @@ class Notifier(private val context: Context) {
         )
         manager.createNotificationChannel(
             NotificationChannel(
+                CHANNEL_MESSAGES,
+                context.getString(R.string.channel_messages),
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = context.getString(R.string.channel_messages_description)
+                enableVibration(true)
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
                 CHANNEL_STATUS,
                 context.getString(R.string.channel_status),
                 NotificationManager.IMPORTANCE_LOW,
@@ -110,6 +120,25 @@ class Notifier(private val context: Context) {
         notify(QUESTION_NOTIFICATION_ID, notification)
     }
 
+    /**
+     * A message Hermes pushed to the watch: `hermes send`, a cron job's
+     * delivery, or the agent's own send_message. No actions — there is nothing
+     * to decide — and one notification id, so the newest message replaces the
+     * previous one instead of stacking up on a 2-inch screen.
+     */
+    fun showMessage(text: String) {
+        val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_hermes)
+            .setContentTitle(context.getString(R.string.title_message))
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(contentIntent())
+            .build()
+        notify(MESSAGE_NOTIFICATION_ID, notification)
+    }
+
     fun clearApproval() {
         NotificationManagerCompat.from(context).cancel(APPROVAL_NOTIFICATION_ID)
     }
@@ -170,10 +199,12 @@ class Notifier(private val context: Context) {
 
     companion object {
         const val CHANNEL_APPROVALS = "hermes-approvals"
+        const val CHANNEL_MESSAGES = "hermes-messages"
         const val CHANNEL_STATUS = "hermes-status"
         const val APPROVAL_NOTIFICATION_ID = 1001
         const val QUESTION_NOTIFICATION_ID = 1002
         const val LINK_NOTIFICATION_ID = 1003
+        const val MESSAGE_NOTIFICATION_ID = 1004
         const val FOREGROUND_NOTIFICATION_ID = 1000
     }
 }

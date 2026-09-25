@@ -49,6 +49,10 @@ object Protocol {
     const val EVENT_SESSION_STARTED = "session.started"
     const val EVENT_SESSION_ENDED = "session.ended"
     const val EVENT_LOOP_STOPPED = "loop.stopped"
+    /** Plain text pushed to the wrist: `hermes send`, cron delivery, the
+     *  agent's send_message tool. Additive within v1 — an older client
+     *  ignores an event it does not know. */
+    const val EVENT_MESSAGE = "message"
 
     val CHOICES = listOf("once", "session", "always", "deny")
 

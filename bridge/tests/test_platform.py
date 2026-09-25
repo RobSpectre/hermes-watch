@@ -655,6 +655,60 @@ async def test_the_watch_is_told_when_the_state_changes(isolated_home):
             assert frame is not None, "the watch never learned the agent was working"
 
 
+async def test_notify_pushes_text_to_the_watch(isolated_home):
+    """The host-side push path: anything on this machine can reach the wrist."""
+    async with rig(isolated_home, allow_all_devices=True) as (_, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/notify",
+                    json={"text": "Hermes: build finished", "device": "dev-1"},
+                ) as response:
+                    assert response.status == 200
+                    body = await response.json()
+                    assert body["ok"] is True
+                    assert body["message_id"]
+            frame = await read_until(ws, lambda f: f.get("event") == "message")
+            assert frame is not None, "the notification never reached the watch"
+            assert frame["payload"]["text"] == "Hermes: build finished"
+
+
+async def test_notify_says_so_when_no_watch_is_listening(isolated_home):
+    """503, not a cheerful 200: a notification must never be claimed undelivered."""
+    async with rig(isolated_home, allow_all_devices=True) as (_, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}/notify", json={"text": "anyone there?"}
+            ) as response:
+                assert response.status == 503
+                body = await response.json()
+                assert body["ok"] is False
+                assert "no watch" in body["error"]
+
+
+async def test_notify_refuses_empty_text(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (_, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}/notify", json={"text": "   "}
+            ) as response:
+                assert response.status == 400
+
+
+async def test_notify_needs_the_shared_secret_when_one_is_configured(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True, ingest_token="s3cret") as (_, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}/notify", json={"text": "hi"}
+            ) as response:
+                assert response.status == 403
+            async with session.post(
+                f"http://127.0.0.1:{port}/notify", json={"text": "hi", "token": "s3cret"}
+            ) as response:
+                assert response.status in (200, 503)  # authorized, watch may be absent
+
+
 async def test_ingest_token_is_enforced_when_configured(isolated_home):
     async with rig(isolated_home, allow_all_devices=True, ingest_token="s3cret") as (adapter, port):
         async with aiohttp.ClientSession() as session:

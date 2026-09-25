@@ -11,6 +11,9 @@
     <string name="action_deny">Deny</string>
     <string name="title_needs_approval">Hermes needs approval</string>
     <string name="title_question">Hermes is asking</string>
+    <string name="channel_messages">Notifications</string>
+    <string name="channel_messages_description">Messages Hermes sends to your watch</string>
+    <string name="title_message">Hermes</string>
     <string name="pairing_title">Pair with bridge</string>
     <string name="pairing_host">Bridge host</string>
     <string name="pairing_port">Port</string>

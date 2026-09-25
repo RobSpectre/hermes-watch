@@ -375,6 +375,57 @@ def test_register_survives_a_context_with_no_platform_support():
     assert ctx.hooks, "hooks must still be registered"
 
 
+# --- sending to the watch --------------------------------------------------
+
+
+def test_a_send_target_parses_as_a_device_label():
+    """The watch's identity is its label, so that is what a caller names."""
+    from hermes_watch.plugin import _parse_target_ref
+
+    assert _parse_target_ref("Pixel Watch 4") == ("Pixel Watch 4", None)
+    assert _parse_target_ref("  Pixel Watch 4  ") == ("Pixel Watch 4", None)
+    assert _parse_target_ref("") is None
+    assert _parse_target_ref("   ") is None
+
+
+async def test_the_out_of_process_sender_posts_to_the_listener(monkeypatch):
+    """`hermes send` runs outside the gateway, so delivery goes over loopback."""
+    from hermes_watch import plugin as plugin_module
+
+    seen: dict = {}
+
+    class FakeClient:
+        def __init__(self, url, token=""):
+            seen["url"] = url
+            seen["token"] = token
+
+        def notify(self, text, *, device=""):
+            seen["text"] = text
+            seen["device"] = device
+            return {"success": True, "platform": "pixel_watch", "chat_id": device, "message_id": "m1"}
+
+    monkeypatch.setattr(plugin_module, "AdapterClient", FakeClient)
+    monkeypatch.setenv("HERMES_WATCH_URL", "http://127.0.0.1:9999")
+
+    class Config:
+        extra = {}
+
+    result = await plugin_module._standalone_send(Config(), "Pixel Watch 4", "build finished")
+    assert seen == {"url": "http://127.0.0.1:9999", "token": "", "text": "build finished",
+                    "device": "Pixel Watch 4"}
+    # The shape Hermes' standalone_sender_fn contract expects.
+    assert result["success"] is True and result["chat_id"] == "Pixel Watch 4"
+
+
+def test_register_declares_addressing_and_standalone_delivery():
+    ctx = FakeContext()
+    register(ctx)
+    platform = ctx.platforms[0]
+    assert callable(platform["parse_target_ref_fn"])
+    assert callable(platform["standalone_sender_fn"])
+    assert platform["cron_deliver_env_var"] == "HERMES_WATCH_HOME_CHANNEL"
+
+
 def test_clip_leaves_short_text_alone():
     assert _clip("short") == "short"
     assert len(_clip("x" * 500, 100)) == 100
