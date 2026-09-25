@@ -215,10 +215,15 @@ class Notifier(private val context: Context) {
 
     /** Ongoing, silent "the link is up" notification for the foreground service. */
     fun statusNotification(snapshot: Snapshot?): android.app.Notification {
+        // Only measured values appear here. The previous fallback substituted the
+        // word "idle" for a missing rate, so an idle watch read "idle · idle" and
+        // a working one read "thinking · idle" -- which both looks like a stuck
+        // app and asserts a state nobody observed.
         val text = snapshot?.let {
-            val rate = it.tokensPerSecondLive?.let { value -> "%.0f tok/s".format(value) } ?: "idle"
-            val remaining = it.contextRemainingPercent?.let { value -> " · %.0f%% ctx".format(value) } ?: ""
-            "${it.agentState} · $rate$remaining"
+            val parts = mutableListOf(it.agentState)
+            it.tokensPerSecondLive?.let { value -> parts += "%.0f tok/s".format(value) }
+            it.contextRemainingPercent?.let { value -> parts += "%.0f%% ctx".format(value) }
+            parts.joinToString(" · ")
         } ?: "connecting…"
         return NotificationCompat.Builder(context, CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_hermes)
