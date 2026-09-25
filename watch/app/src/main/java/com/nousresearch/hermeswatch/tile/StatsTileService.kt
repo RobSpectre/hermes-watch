@@ -1,19 +1,20 @@
 package com.nousresearch.hermeswatch.tile
 
 import androidx.wear.protolayout.ColorBuilders.argb
-import androidx.wear.protolayout.DeviceParametersBuilders.DeviceParameters
 import androidx.wear.protolayout.DimensionBuilders.dp
+import androidx.wear.protolayout.DimensionBuilders.expand
 import androidx.wear.protolayout.LayoutElementBuilders
 import androidx.wear.protolayout.LayoutElementBuilders.Box
 import androidx.wear.protolayout.LayoutElementBuilders.Column
 import androidx.wear.protolayout.LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER
+import androidx.wear.protolayout.LayoutElementBuilders.VERTICAL_ALIGN_CENTER
 import androidx.wear.protolayout.ResourceBuilders
 import androidx.wear.protolayout.material.Text
 import androidx.wear.protolayout.material.Typography
-import androidx.wear.protolayout.material.layouts.PrimaryLayout
 import androidx.wear.tiles.RequestBuilders
 import androidx.wear.tiles.TileBuilders
 import androidx.wear.tiles.TileService
+import androidx.wear.tiles.TimelineBuilders
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.nousresearch.hermeswatch.data.Frame
@@ -31,16 +32,19 @@ import com.nousresearch.hermeswatch.data.toSnapshot
  * nothing most of the time and would keep the radio awake trying. Everything
  * here is synchronous by necessity; the API hands back a `ListenableFuture`, and
  * the value is already on disk.
+ *
+ * The layout is built from raw protolayout elements rather than `PrimaryLayout`:
+ * it needs no device parameters, which keeps this file independent of the
+ * device-parameter type that differs between the `tiles` and `protolayout`
+ * artifacts.
  */
 class StatsTileService : TileService() {
 
     override fun onTileRequest(requestParams: RequestBuilders.TileRequest): ListenableFuture<TileBuilders.Tile> {
-        val device = requestParams.deviceParameters
-        val snapshot = readSnapshot()
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion(RESOURCES_VERSION)
             .setTileTimeline(
-                TileBuilders.Timeline.fromLayoutElement(layout(snapshot, device)),
+                TimelineBuilders.Timeline.fromLayoutElement(tileLayout(readSnapshot())),
             )
             .build()
         return Futures.immediateFuture(tile)
@@ -58,7 +62,7 @@ class StatsTileService : TileService() {
         }.getOrNull()
     }
 
-    private fun layout(snapshot: Snapshot?, device: DeviceParameters?): LayoutElementBuilders.LayoutElement {
+    private fun tileLayout(snapshot: Snapshot?): LayoutElementBuilders.LayoutElement {
         val state = snapshot?.agentState ?: "offline"
         val stateColor = when (state) {
             "waiting_approval", "waiting_input" -> COLOR_ALERT
@@ -69,35 +73,37 @@ class StatsTileService : TileService() {
         val context = snapshot?.contextRemainingPercent?.let { "%.0f%% context".format(it) } ?: "context —"
         val tokens = snapshot?.sessionTokens?.let(::formatCompact) ?: "—"
 
-        return PrimaryLayout.Builder(device)
-            .setResponsiveContentInsetEnabled(true)
-            .setContent(
-                Column.Builder()
-                    .setHorizontalAlignment(HORIZONTAL_ALIGN_CENTER)
-                    .addContent(
-                        Text.Builder(this, state.replace('_', ' '))
-                            .setTypography(Typography.TYPOGRAPHY_TITLE3)
-                            .setColor(argb(stateColor))
-                            .build(),
-                    )
-                    .addContent(spacer(4f))
-                    .addContent(
-                        Text.Builder(this, rate)
-                            .setTypography(Typography.TYPOGRAPHY_BODY1)
-                            .build(),
-                    )
-                    .addContent(
-                        Text.Builder(this, context)
-                            .setTypography(Typography.TYPOGRAPHY_BODY2)
-                            .build(),
-                    )
-                    .addContent(
-                        Text.Builder(this, "$tokens this session")
-                            .setTypography(Typography.TYPOGRAPHY_CAPTION1)
-                            .build(),
-                    )
+        val column = Column.Builder()
+            .setHorizontalAlignment(HORIZONTAL_ALIGN_CENTER)
+            .addContent(
+                Text.Builder(this, state.replace('_', ' '))
+                    .setTypography(Typography.TYPOGRAPHY_TITLE3)
+                    .setColor(argb(stateColor))
                     .build(),
             )
+            .addContent(spacer(4f))
+            .addContent(
+                Text.Builder(this, rate)
+                    .setTypography(Typography.TYPOGRAPHY_BODY1)
+                    .build(),
+            )
+            .addContent(
+                Text.Builder(this, context)
+                    .setTypography(Typography.TYPOGRAPHY_BODY2)
+                    .build(),
+            )
+            .addContent(
+                Text.Builder(this, "$tokens this session")
+                    .setTypography(Typography.TYPOGRAPHY_CAPTION1)
+                    .build(),
+            )
+            .build()
+
+        return Box.Builder()
+            .setWidth(expand())
+            .setHeight(expand())
+            .setVerticalAlignment(VERTICAL_ALIGN_CENTER)
+            .addContent(column)
             .build()
     }
 

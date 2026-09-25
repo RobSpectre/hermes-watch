@@ -22,7 +22,7 @@ import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.Button
 import androidx.wear.compose.material.MaterialTheme
-import androidx.wear.compose.material.OutlinedTextField
+import androidx.wear.compose.material.TextField
 import androidx.wear.compose.material.PositionIndicator
 import androidx.wear.compose.material.Scaffold
 import androidx.wear.compose.material.Text
@@ -63,21 +63,19 @@ fun PairingScreen(
                 )
             }
             item {
-                OutlinedTextField(
+                TextField(
                     value = host,
                     onValueChange = { host = it },
                     label = { Text("Bridge host") },
-                    singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
             item {
-                OutlinedTextField(
+                TextField(
                     value = port,
                     onValueChange = { port = it.filter { ch -> ch.isDigit() } },
                     label = { Text("Port") },
-                    singleLine = true,
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Number,
                         imeAction = ImeAction.Next,
@@ -86,11 +84,10 @@ fun PairingScreen(
                 )
             }
             item {
-                OutlinedTextField(
+                TextField(
                     value = token,
                     onValueChange = { token = it.trim() },
                     label = { Text("Pairing token") },
-                    singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     modifier = Modifier.fillMaxWidth(),
                 )

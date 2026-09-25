@@ -1,27 +1,34 @@
 package com.nousresearch.hermeswatch.ui
 
 import androidx.compose.runtime.Composable
-import androidx.wear.compose.material.MaterialTheme
-import androidx.wear.compose.material.darkColors
 import androidx.compose.ui.graphics.Color
+import androidx.wear.compose.material.MaterialTheme
 
 /**
- * A dark, high-contrast palette for quick glances outdoors. Deliberately not
- * dynamic-colour: a glanceable readout needs the same colour for "context is
- * running out" on every watch, rather than whatever wallpaper the user picked.
+ * The few colours this app attaches meaning to.
+ *
+ * Explicit constants rather than a themed palette: the point of the stats screen
+ * is that the same state looks the same on every watch, so these must not come
+ * from whatever colour scheme the system chose.
  */
-private val HermesColors = darkColors(
-    primary = Color(0xFF5EE6C4),
-    onPrimary = Color(0xFF00201A),
-    secondary = Color(0xFF9AA4B2),
-    background = Color(0xFF0B0E14),
-    onBackground = Color(0xFFE6EAF2),
-    surface = Color(0xFF141924),
-    onSurface = Color(0xFFE6EAF2),
-    error = Color(0xFFFF6B6B),
-)
+object HermesColors {
+    /** Healthy: the link is up and context has room. */
+    val Active = Color(0xFF5EE6C4)
+
+    /** Context is meaningfully consumed. */
+    val Warning = Color(0xFFF5A623)
+
+    /** Needs a human, or the context is nearly gone. */
+    val Alert = Color(0xFFFF6B6B)
+
+    /** Nothing to report. */
+    val Muted = Color(0xFF9AA4B2)
+}
 
 @Composable
 fun HermesWatchTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colors = HermesColors, content = content)
+    // Default MaterialTheme colours only. The colours that carry meaning are set
+    // explicitly where they are drawn, rather than relying on a themed `primary`
+    // whose definition moves between wear-compose releases.
+    MaterialTheme(content = content)
 }

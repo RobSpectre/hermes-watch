@@ -16,13 +16,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
-import androidx.wear.compose.material.Card
 import androidx.wear.compose.material.Chip
 import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.MaterialTheme
@@ -186,10 +184,10 @@ private fun ContextBar(remainingPercent: Double?, source: String?) {
     val known = remainingPercent != null
     val fraction = ((remainingPercent ?: 0.0) / 100.0).coerceIn(0.0, 1.0).toFloat()
     val color = when {
-        !known -> MaterialTheme.colors.onSurface.copy(alpha = 0.3f)
-        remainingPercent!! < 10 -> MaterialTheme.colors.error
-        remainingPercent < 25 -> Color(0xFFF5A623)
-        else -> MaterialTheme.colors.primary
+        !known -> HermesColors.Muted
+        remainingPercent!! < 10 -> HermesColors.Alert
+        remainingPercent < 25 -> HermesColors.Warning
+        else -> HermesColors.Active
     }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -230,37 +228,34 @@ private fun ContextBar(remainingPercent: Double?, source: String?) {
  */
 @Composable
 private fun ApprovalCard(request: PendingRequest, onAnswer: (String, String) -> Unit) {
-    Card(
+    // A plain Column rather than a Card: wear-compose's clickable Card overload
+    // requires an onClick, and a card that looks tappable but only responds to
+    // the chips inside it would be a lie about where to press.
+    Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            // Colour carries the urgency; the Card itself keeps the theme's
-            // surface so the text stays legible on every watch face.
-            Text(
-                "Needs approval",
-                style = MaterialTheme.typography.title3,
-                color = MaterialTheme.colors.error,
+        // Colour carries the urgency, and the notification is the real alert.
+        Text(
+            "Needs approval",
+            style = MaterialTheme.typography.title3,
+            color = HermesColors.Alert,
+        )
+        request.command?.let {
+            Text(it, style = MaterialTheme.typography.body2, textAlign = TextAlign.Center)
+        }
+        request.description?.takeIf { it.isNotBlank() }?.let {
+            Text(it, style = MaterialTheme.typography.caption1, textAlign = TextAlign.Center)
+        }
+        request.remainingSeconds?.let {
+            Text("${it.toInt()}s left", style = MaterialTheme.typography.caption2)
+        }
+        request.choices.forEach { choice ->
+            Chip(
+                label = { Text(choiceLabel(choice)) },
+                onClick = { onAnswer(request.id, choice) },
             )
-            request.command?.let {
-                Text(it, style = MaterialTheme.typography.body2, textAlign = TextAlign.Center)
-            }
-            request.description?.takeIf { it.isNotBlank() }?.let {
-                Text(it, style = MaterialTheme.typography.caption1, textAlign = TextAlign.Center)
-            }
-            request.remainingSeconds?.let {
-                Text("${it.toInt()}s left", style = MaterialTheme.typography.caption2)
-            }
-            request.choices.forEach { choice ->
-                Chip(
-                    label = { Text(choiceLabel(choice)) },
-                    onClick = { onAnswer(request.id, choice) },
-                    colors = if (choice == "deny") ChipDefaults.secondaryChipColors()
-                    else ChipDefaults.primaryChipColors(),
-                )
-            }
         }
     }
 }

@@ -159,7 +159,9 @@ fun Frame.toSnapshot(): Snapshot? {
 
 private fun JsonObject.toPendingRequest(): PendingRequest? {
     val id = str("id") ?: return null
-    val body = payload.obj()
+    // `payload` is the *outer* frame's field; inside this receiver it has to be
+    // looked up explicitly.
+    val body = this["payload"].obj()
     val choices = this["choices"]?.let { element ->
         runCatching { element.jsonArray.map { it.jsonPrimitive.content } }.getOrNull()
     } ?: emptyList()
