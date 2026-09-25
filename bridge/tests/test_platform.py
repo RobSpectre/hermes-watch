@@ -599,6 +599,62 @@ async def test_a_broadcast_never_reaches_an_unpaired_watch(isolated_home):
             assert await read_until(ws, lambda f: f.get("event") == "message", timeout=0.5) is None
 
 
+async def test_a_resolved_approval_returns_to_the_state_it_interrupted(isolated_home):
+    """A wait is a parenthesis. Restoring "thinking" made an idle gateway lie.
+
+    Seen live: an approval posted to /event with no agent behind it left the
+    listener reporting ``state: thinking`` forever.
+    """
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        assert adapter._state == "idle"
+
+        async def push() -> dict:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_APPROVAL_REQUESTED, "id": "apv_state",
+                          "choices": ["once", "deny"], "timeout": 10,
+                          "payload": {"command": "echo hi"}},
+                ) as response:
+                    return await response.json()
+
+        async with watch(port) as ws:
+            await say_hello(ws)
+            # The watch has to be connected before the prompt is posted: with
+            # nowhere to deliver it, the adapter refuses the request outright.
+            ask = asyncio.create_task(push())
+            await read_until(ws, lambda f: f.get("event") == p.E_APPROVAL_REQUESTED)
+            assert adapter._state == "waiting_approval"
+            await ws.send_str(json.dumps({"v": 1, "type": "answer",
+                                          "id": "apv_state", "choice": "once"}))
+            body = await ask
+        assert body["choice"] == "once"
+        assert adapter._state == "idle", "an idle gateway claimed to be working"
+
+
+async def test_a_resolved_approval_returns_to_thinking_during_a_turn(isolated_home):
+    """The same rule in the case it was written for: mid-turn, resume working."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        bus.observe(p.E_TURN_STARTED, {"turn_id": "t1"})
+        assert adapter._state == "thinking"
+        bus.observe(p.E_APPROVAL_REQUESTED, {"id": "apv_mid", "command": "echo hi"})
+        assert adapter._state == "waiting_approval"
+        bus.observe(p.E_APPROVAL_RESOLVED, {"id": "apv_mid", "choice": "once"})
+        assert adapter._state == "thinking"
+        bus.observe(p.E_TURN_ENDED, {"turn_id": "t1"})
+        assert adapter._state == "idle"
+
+
+async def test_the_watch_is_told_when_the_state_changes(isolated_home):
+    """The state rides the stats frame, so a change must be pushed."""
+    async with rig(isolated_home, allow_all_devices=True) as (_, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            bus.observe(p.E_TURN_STARTED, {"turn_id": "t1"})
+            frame = await read_until(ws, lambda f: (f.get("live") or {}).get("agent_state") == "thinking")
+            assert frame is not None, "the watch never learned the agent was working"
+
+
 async def test_ingest_token_is_enforced_when_configured(isolated_home):
     async with rig(isolated_home, allow_all_devices=True, ingest_token="s3cret") as (adapter, port):
         async with aiohttp.ClientSession() as session:

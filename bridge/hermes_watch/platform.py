@@ -74,6 +74,10 @@ PING_INTERVAL_S = 30.0
 #: How long an approved-unpaired decision is cached before re-reading the store.
 PAIRING_CACHE_S = 5.0
 
+#: States that mean "the agent is blocked on a human". They are entered from a
+#: working state and left back to it, which is why the pair is named once here.
+WAITING_STATES = ("waiting_approval", "waiting_input")
+
 MAX_BODY_BYTES = 256 * 1024
 MAX_FRAME_BYTES = 64 * 1024
 
@@ -187,6 +191,9 @@ class HermesWatchAdapter(BasePlatformAdapter):
 
         self._state = "idle"
         self._state_changed_at = time.time()
+        #: What the agent was doing before a prompt parked it. Restoring this is
+        #: why an idle gateway stops claiming to be thinking.
+        self._state_before_wait: Optional[str] = None
         self._last_tool: Optional[str] = None
         self._started_at = time.time()
         # DB access is blocking (sqlite3); it runs off-loop, and the engine is
@@ -579,7 +586,7 @@ class HermesWatchAdapter(BasePlatformAdapter):
                     responder="watch" if resolution is not None else "timeout")
         )
         if not self._pending:
-            self._set_state("thinking")
+            self._resume_after_wait()
         await self._broadcast_stats()
         return True
 
@@ -705,9 +712,9 @@ class HermesWatchAdapter(BasePlatformAdapter):
             p.E_TOOL_FINISHED: "thinking",
             p.E_TURN_ENDED: "idle",
             p.E_APPROVAL_REQUESTED: "waiting_approval",
-            p.E_APPROVAL_RESOLVED: "thinking",
             p.E_QUESTION_PENDING: "waiting_input",
-            p.E_QUESTION_RESOLVED: "thinking",
+            # Resolutions are handled by _resume_after_wait, not by a mapping:
+            # they restore the state the prompt interrupted.
             p.E_SESSION_ENDED: "idle",
             p.E_LOOP_STOPPED: "idle",
         }
@@ -715,12 +722,15 @@ class HermesWatchAdapter(BasePlatformAdapter):
             self._last_tool = payload.get("tool_name") or state.last_tool
         elif name in (p.E_TURN_ENDED, p.E_LOOP_STOPPED, p.E_SESSION_ENDED):
             self._last_tool = None
-        new_state = mapping.get(name)
-        if new_state is None:
-            return
-        if new_state != self._state:
-            self._state = new_state
-            self._state_changed_at = time.time()
+        if name in (p.E_APPROVAL_RESOLVED, p.E_QUESTION_RESOLVED):
+            # Not "thinking" (see _resume_after_wait): the agent goes back to
+            # what it was doing, which may be nothing at all.
+            self._resume_after_wait()
+        else:
+            new_state = mapping.get(name)
+            if new_state is None:
+                return
+            self._set_state(new_state)
         pending = self._pending_for_event(name, payload)
         try:
             loop = asyncio.get_event_loop()
@@ -747,9 +757,25 @@ class HermesWatchAdapter(BasePlatformAdapter):
             "approval": "waiting_approval",
             "question": "waiting_input",
         }.get(kind_or_state, kind_or_state)
-        if state != self._state:
-            self._state = state
-            self._state_changed_at = time.time()
+        if state == self._state:
+            return
+        if state in WAITING_STATES and self._state_before_wait is None:
+            self._state_before_wait = self._state
+        self._state = state
+        self._state_changed_at = time.time()
+
+    def _resume_after_wait(self) -> None:
+        """Leave a waiting state by returning to what the agent was doing.
+
+        A wait is a parenthesis: while the agent blocks on a human it is doing
+        nothing, so the state has to say ``waiting_*``. When the answer lands
+        the agent resumes whatever it was doing before -- and if we have no
+        evidence it was doing anything, the honest state is ``idle``, not
+        ``thinking``. Assuming thinking left an idle gateway claiming to work.
+        """
+        previous = self._state_before_wait or "idle"
+        self._state_before_wait = None
+        self._set_state(previous)
 
     def _live_frame(self) -> dict[str, Any]:
         return {
