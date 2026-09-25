@@ -213,24 +213,35 @@ class Notifier(private val context: Context) {
         notify(id, notification)
     }
 
-    /** Ongoing, silent "the link is up" notification for the foreground service. */
+    /**
+     * The one-line status text, shared by the notification and by the service's
+     * decision to re-post it. Only measured values appear: an earlier fallback
+     * substituted the word "idle" for a missing rate, so an idle watch read
+     * "idle · idle" and a working one read "thinking · idle".
+     */
+    fun statusText(snapshot: Snapshot?): String = snapshot?.let {
+        listOfNotNull(
+            it.agentState,
+            it.tokensPerSecondLive?.let { value -> "%.0f tok/s".format(value) },
+            it.contextRemainingPercent?.let { value -> "%.0f%% ctx".format(value) },
+        ).joinToString(" · ")
+    } ?: "connecting…"
+
+    /** Silent "the link is up" notification for the foreground service. */
     fun statusNotification(snapshot: Snapshot?): android.app.Notification {
-        // Only measured values appear here. The previous fallback substituted the
-        // word "idle" for a missing rate, so an idle watch read "idle · idle" and
-        // a working one read "thinking · idle" -- which both looks like a stuck
-        // app and asserts a state nobody observed.
-        val text = snapshot?.let {
-            val parts = mutableListOf(it.agentState)
-            it.tokensPerSecondLive?.let { value -> parts += "%.0f tok/s".format(value) }
-            it.contextRemainingPercent?.let { value -> parts += "%.0f%% ctx".format(value) }
-            parts.joinToString(" · ")
-        } ?: "connecting…"
+        val text = statusText(snapshot)
         return NotificationCompat.Builder(context, CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_hermes)
             .setContentTitle(context.getString(R.string.app_name))
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
+            // Deliberately *not* ongoing. A foreground service has to post a
+            // notification, but pinning it is what makes Wear OS surface the
+            // app in the Recents section of the launcher and as a watch-face
+            // chip -- so rolling the crown showed "Hermes Watch / idle" as
+            // though the app were sitting open. Without the flag the service,
+            // the socket and the status line all behave the same, and the watch
+            // stops advertising a task the user never started.
             .setShowWhen(false)
             .setContentIntent(contentIntent())
             .build()

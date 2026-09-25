@@ -186,11 +186,23 @@ class WatchLinkService : Service() {
     }
 
     private fun refreshForegroundNotification() {
+        // Only when the text actually changes. This used to re-post on every
+        // snapshot -- every 1.5-5s -- which churned the notification shade and
+        // made the status line impossible to dismiss: it reappeared on the next
+        // tick. Nothing is lost by waiting for a real change, because the text
+        // only says what the state and the measurements already say.
+        val snapshot = currentSnapshot
+        val text = notifier.statusText(snapshot)
+        if (text == lastForegroundText) return
+        lastForegroundText = text
         runCatching {
             val manager = getSystemService(android.app.NotificationManager::class.java)
-            manager?.notify(Notifier.FOREGROUND_NOTIFICATION_ID, notifier.statusNotification(currentSnapshot))
+            manager?.notify(Notifier.FOREGROUND_NOTIFICATION_ID, notifier.statusNotification(snapshot))
         }
     }
+
+    @Volatile
+    private var lastForegroundText: String? = null
 
     @Volatile
     private var currentSettings: BridgeSettings? = null
