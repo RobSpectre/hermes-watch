@@ -12,7 +12,6 @@ Two failure modes matter here, and both are absences rather than errors:
 
 from __future__ import annotations
 
-import importlib.util
 from typing import Any, Optional
 
 import pytest
@@ -326,10 +325,18 @@ def test_register_wires_hooks_transport_and_platform():
     assert callable(platform["check_fn"])
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("gateway.platforms.base") is None,
-    reason="needs a Hermes installation",
-)
+try:
+    # Same guard as test_platform.py's importorskip: the adapter needs Hermes,
+    # and a bare runner has none. `find_spec` is not usable here -- it raises
+    # when the parent package is missing rather than returning None.
+    import gateway.platforms.base  # noqa: F401
+
+    _HERMES_AVAILABLE = True
+except Exception:  # noqa: BLE001 - any import failure means "no Hermes"
+    _HERMES_AVAILABLE = False
+
+
+@pytest.mark.skipif(not _HERMES_AVAILABLE, reason="needs a Hermes installation")
 def test_the_registered_factory_builds_a_real_adapter():
     from gateway.config import PlatformConfig
 
