@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The bridge speaks plain ws:// on the LAN. cleartextTrafficPermitted is
+         scoped in res/xml/network_security_config.xml; TLS is on the roadmap. -->
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <application
+        android:name=".HermesWatchApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HermesWatch">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:taskAffinity=""
+            android:theme="@style/Theme.HermesWatch">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Holds the WebSocket to the bridge and owns the notification. A
+             foreground service is the only way Wear OS will keep a socket alive
+             with the screen off. dataSync is the correct type: this is a
+             low-rate control/data stream, not a Bluetooth device link. -->
+        <service
+            android:name=".service.WatchLinkService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Notification action buttons route here, then back into the service
+             so the socket write always happens in one place. -->
+        <receiver
+            android:name=".service.AnswerReceiver"
+            android:exported="false" />
+
+        <!-- Stats tile: glanceable agent state without opening the app. -->
+        <service
+            android:name=".tile.StatsTileService"
+            android:exported="true"
+            android:label="@string/tile_label"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+    </application>
+</manifest>

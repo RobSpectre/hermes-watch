@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Static tile preview shown in the tile picker before the tile is added. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="200dp"
+    android:height="200dp"
+    android:viewportWidth="200"
+    android:viewportHeight="200">
+    <path
+        android:fillColor="#FF0B0E14"
+        android:pathData="M0,0h200v200h-200z" />
+    <path
+        android:fillColor="#FF5EE6C4"
+        android:pathData="M24,40h12v14h-12zM24,62h60v8h-60zM24,80h96v8h-96zM24,98h44v8h-44z" />
+    <path
+        android:fillColor="#FF3B82F6"
+        android:pathData="M136,40h40v40h-40z" />
+</vector>

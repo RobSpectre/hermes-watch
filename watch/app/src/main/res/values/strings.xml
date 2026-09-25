@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">Hermes Watch</string>
+    <string name="tile_label">Hermes</string>
+    <string name="channel_approvals">Approval requests</string>
+    <string name="channel_approvals_description">Hermes is blocked waiting for you to approve a command</string>
+    <string name="channel_status">Agent status</string>
+    <string name="channel_status_description">Quiet updates while Hermes is working</string>
+    <string name="action_approve_once">Allow once</string>
+    <string name="action_approve_session">Allow session</string>
+    <string name="action_approve_always">Always</string>
+    <string name="action_deny">Deny</string>
+    <string name="title_needs_approval">Hermes needs approval</string>
+    <string name="title_question">Hermes is asking</string>
+    <string name="pairing_title">Pair with bridge</string>
+    <string name="pairing_host">Bridge host</string>
+    <string name="pairing_port">Port</string>
+    <string name="pairing_token">Pairing token</string>
+    <string name="pairing_save">Connect</string>
+    <string name="stats_title">Hermes</string>
+    <string name="label_tok_per_s">tok/s</string>
+    <string name="label_context">Context left</string>
+    <string name="label_session_tokens">This session</string>
+    <string name="label_30d_tokens">Last 30 days</string>
+</resources>

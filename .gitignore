@@ -1,0 +1,27 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# android / gradle
+.gradle/
+local.properties
+*.apk
+*.aab
+captures/
+watch/app/release/
+
+# editors / os
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# local runtime state — never commit a pairing token
+hermes-watch/
+*.log

@@ -1,0 +1,3 @@
+name: hermes-watch
+version: "0.1.0"
+description: "Push Hermes approvals, questions and live token/context stats to a Wear OS watch."

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome notification/tile glyph: a stylised caduceus-free "H" mark.
+     Kept as a simple vector so it renders on every Wear OS device without a
+     density-specific bitmap. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M7,4h2.2v6.2h5.6V4H17v16h-2.2v-7.6H9.2V20H7z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,9.5h1.7v1.7H4zM18.3,9.5H20v1.7h-1.7z" />
+</vector>

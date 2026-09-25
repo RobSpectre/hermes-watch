@@ -1,0 +1,8 @@
+<resources>
+    <!-- The watch app is Compose-only; this theme exists to give the activity a
+         window background and no action bar. -->
+    <style name="Theme.HermesWatch" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+    </style>
+</resources>

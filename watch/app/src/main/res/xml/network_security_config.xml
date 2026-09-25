@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The bridge speaks ws:// on the local network, so cleartext has to be permitted
+  for private ranges only. Everything else stays TLS-only: a bridge reachable
+  over the public internet should be behind TLS or a tunnel, not this exception.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- RFC1918 private ranges, in the literal forms Android accepts. -->
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
