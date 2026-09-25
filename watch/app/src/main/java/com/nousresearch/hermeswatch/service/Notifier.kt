@@ -32,6 +32,12 @@ class Notifier(private val context: Context) {
 
     fun ensureChannels() {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        // Channels we have superseded. Recreating a channel with the same id
+        // does *not* reliably apply new settings -- the system restored the old
+        // mVibrationPattern when this file first tried it -- so the alerting
+        // channels are versioned and the previous ids are cleaned up here. The
+        // user sees one set of channels either way.
+        RETIRED_CHANNELS.forEach(manager::deleteNotificationChannel)
         ensureChannel(
             manager, CHANNEL_APPROVALS, R.string.channel_approvals,
             R.string.channel_approvals_description, NotificationManager.IMPORTANCE_HIGH, ALERT_PATTERN,
@@ -52,9 +58,10 @@ class Notifier(private val context: Context) {
      *
      * A channel's vibration pattern is fixed at creation: an app may rename and
      * re-describe a channel later, but not change how it buzzes, so an installed
-     * app would keep the old pattern forever. Deleting and recreating costs the
-     * user's per-channel customisation once, and is the only way an upgrade
-     * actually reaches a watch that already has the channel.
+     * app would keep the old pattern forever. Deleting and recreating under the
+     * same id was not enough either -- the system restored the previous pattern
+     * -- hence the versioned ids: a new id is the only thing that reliably takes
+     * effect, which is why the constant above carries a version.
      */
     private fun ensureChannel(
         manager: NotificationManager,
@@ -244,8 +251,11 @@ class Notifier(private val context: Context) {
     }
 
     companion object {
-        const val CHANNEL_APPROVALS = "hermes-approvals"
-        const val CHANNEL_MESSAGES = "hermes-messages"
+        //: Versioned: the vibration pattern is fixed when a channel is created,
+        //: so a change to it needs a new id rather than a recreated one.
+        const val CHANNEL_APPROVALS = "hermes-approvals-v2"
+        const val CHANNEL_MESSAGES = "hermes-messages-v2"
+        val RETIRED_CHANNELS = listOf("hermes-approvals", "hermes-messages")
         const val CHANNEL_STATUS = "hermes-status"
         const val APPROVAL_NOTIFICATION_ID = 1001
         const val QUESTION_NOTIFICATION_ID = 1002
