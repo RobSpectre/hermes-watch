@@ -147,6 +147,51 @@ hermes-watch doctor             # listener up? plugin installed? devices paired?
 python bridge/tools/fake_watch.py --pair --answer once
 ```
 
+## Sending notifications to the watch
+
+Approvals and questions notify on their own — that is the point of the app. For
+everything else, the watch is a registered platform, so Hermes' normal delivery
+paths reach it:
+
+```bash
+hermes send -t pixel_watch "build finished"                 # home channel
+hermes send -t "pixel_watch:Pixel Watch 4" "build finished"  # a named device
+```
+
+`hermes send` is the script/cron path: no LLM, no agent loop. The agent itself
+can do the same with its `send_message` tool, and a cron job with
+`deliver=pixel_watch`. Set the home channel once so the bare form resolves:
+
+```bash
+hermes config set platforms.pixel_watch.home_channel.chat_id "Pixel Watch 4"
+hermes config set platforms.pixel_watch.home_channel.platform pixel_watch
+```
+
+Anything that is not Hermes at all can use the listener's loopback endpoint
+directly:
+
+```bash
+curl -X POST http://127.0.0.1:8787/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "backup finished", "device": "Pixel Watch 4"}'
+```
+
+Notes that matter:
+
+* The **device id is the label** the watch sends — the app's protocol carries no
+  other identifier. `hermes send -l` lists the platform; an unknown device is an
+  error, not a silent drop.
+* Delivery **fails honestly**: with no watch connected, `hermes send` reports the
+  failure and `/notify` returns HTTP 503 with `{"ok": false}`. Nothing is ever
+  reported as sent that did not reach a socket.
+* A message arrives on the **Notifications** channel, one notification at a time:
+  the newest replaces the previous one rather than stacking up on a 2-inch
+  screen.
+* `/notify` and `/event` are **loopback only** — the listener is bound to the LAN
+  so the watch can reach it, and these endpoints would otherwise let anyone on
+  the network speak as Hermes. Set `extra.ingest_token` and pass it as `token` to
+  require a shared secret on both.
+
 ## What the numbers mean
 
 Precision here is the point of the project, so each number says how it was
