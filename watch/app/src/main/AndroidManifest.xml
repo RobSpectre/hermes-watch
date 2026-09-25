@@ -21,11 +21,18 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.HermesWatch">
 
+        <!-- excludeFromRecents: this is a notifier, not a task to switch back to.
+             Without it, opening the app left a task in Recents that the launcher
+             showed as "Hermes Watch / idle" when the crown was rolled, which
+             reads as an app that never closes. The launcher entry stays, so the
+             app is still one tap from the app list, and tapping a notification
+             still opens it. -->
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:taskAffinity=""
+            android:excludeFromRecents="true"
             android:theme="@style/Theme.HermesWatch">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
