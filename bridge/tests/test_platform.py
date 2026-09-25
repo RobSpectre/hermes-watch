@@ -674,6 +674,50 @@ async def test_notify_pushes_text_to_the_watch(isolated_home):
             assert frame["payload"]["text"] == "Hermes: build finished"
 
 
+async def test_turn_finished_stays_silent_by_default(isolated_home):
+    """Off unless asked: one buzz per turn is noise in a busy gateway."""
+    async with rig(isolated_home, allow_all_devices=True) as (_, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_LOOP_STOPPED, "payload": {"reason": "completed"}},
+                ) as response:
+                    assert response.status == 200
+            assert await read_until(ws, lambda f: f.get("event") == p.E_LOOP_STOPPED, timeout=0.6) is None
+
+
+async def test_turn_finished_notifies_when_opted_in(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True, notify_turn_finished=True) as (_, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_LOOP_STOPPED, "payload": {"reason": "completed"}},
+                ) as response:
+                    assert response.status == 200
+            frame = await read_until(ws, lambda f: f.get("event") == p.E_LOOP_STOPPED)
+            assert frame is not None, "an opted-in host never told the watch the turn ended"
+            assert frame["payload"]["reason"] == "completed"
+
+
+async def test_an_opted_in_host_still_reports_state(isolated_home):
+    """The notification is additional: the state line keeps working either way."""
+    async with rig(isolated_home, allow_all_devices=True, notify_turn_finished=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_LOOP_STOPPED, "payload": {}},
+                ) as response:
+                    assert response.status == 200
+            await read_until(ws, lambda f: f.get("event") == p.E_LOOP_STOPPED)
+            assert adapter._state == "idle"
+
+
 async def test_notify_says_so_when_no_watch_is_listening(isolated_home):
     """503, not a cheerful 200: a notification must never be claimed undelivered."""
     async with rig(isolated_home, allow_all_devices=True) as (_, port):

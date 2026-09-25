@@ -78,6 +78,11 @@ PAIRING_CACHE_S = 5.0
 #: working state and left back to it, which is why the pair is named once here.
 WAITING_STATES = ("waiting_approval", "waiting_input")
 
+#: Lifecycle events that mean the agent has stopped working: the end of a turn
+#: (`agent_loop_stopped`) or of a session. Both already drive the state line;
+#: with `notify_turn_finished` they also become a notification.
+TURN_FINISHED_EVENTS = (p.E_LOOP_STOPPED, p.E_TURN_ENDED, p.E_SESSION_ENDED)
+
 MAX_BODY_BYTES = 256 * 1024
 MAX_FRAME_BYTES = 64 * 1024
 
@@ -174,6 +179,10 @@ class HermesWatchAdapter(BasePlatformAdapter):
         self._allowed_devices = {str(d).strip() for d in (extra.get("allowed_devices") or []) if str(d).strip()}
         self._allow_all = bool(extra.get("allow_all_devices", False))
         self._ingest_token = str(extra.get("ingest_token", "") or "")
+        #: Notify the wrist when the agent stops working. Off by default: in a
+        #: busy gateway it would be one buzz per turn, and "the agent finished"
+        #: is noise unless you are waiting on a long job.
+        self._notify_turn_finished = bool(extra.get("notify_turn_finished", False))
 
         self._links: dict[str, _WatchLink] = {}
         self._pending: dict[str, _Pending] = {}
@@ -693,8 +702,13 @@ class HermesWatchAdapter(BasePlatformAdapter):
             return web.json_response({"ok": True})
 
         if name != p.E_APPROVAL_REQUESTED and name != p.E_QUESTION_PENDING:
-            # A lifecycle observation: fold it into state and we are done.
+            # A lifecycle observation: fold it into state, which is how the
+            # watch's state line stays honest.
             bus.observe(name, payload)
+            if self._notify_turn_finished and name in TURN_FINISHED_EVENTS:
+                # Also broadcast it, so the app can raise a notification rather
+                # than only moving the state line. Opt-in: see the flag's note.
+                await self._broadcast(p.event(name, **payload))
             return web.json_response({"ok": True})
 
         kind = "approval" if name == p.E_APPROVAL_REQUESTED else "question"

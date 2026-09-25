@@ -146,6 +146,13 @@ class WatchLinkService : Service() {
                 notifier.showQuestion(question)
             }
             Protocol.EVENT_QUESTION_RESOLVED -> notifier.clearQuestion()
+            // Sent only when the host opted in (`extra.notify_turn_finished`):
+            // "the agent stopped" is wanted when waiting on a long job and noise
+            // otherwise, so the source decides, not the watch.
+            Protocol.EVENT_LOOP_STOPPED, Protocol.EVENT_TURN_ENDED, Protocol.EVENT_SESSION_ENDED -> {
+                val reason = frame.payload?.get("reason")?.toString()?.trim('"')
+                notifier.showTurnFinished(reason)
+            }
             Protocol.EVENT_MESSAGE -> {
                 val text = frame.payload?.get("text")?.toString()?.trim('"') ?: return
                 if (text.isNotBlank()) notifier.showMessage(text)

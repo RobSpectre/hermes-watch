@@ -32,34 +32,54 @@ class Notifier(private val context: Context) {
 
     fun ensureChannels() {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_APPROVALS,
-                context.getString(R.string.channel_approvals),
-                NotificationManager.IMPORTANCE_HIGH,
-            ).apply {
-                description = context.getString(R.string.channel_approvals_description)
-                enableVibration(true)
-            },
+        ensureChannel(
+            manager, CHANNEL_APPROVALS, R.string.channel_approvals,
+            R.string.channel_approvals_description, NotificationManager.IMPORTANCE_HIGH, ALERT_PATTERN,
         )
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_MESSAGES,
-                context.getString(R.string.channel_messages),
-                NotificationManager.IMPORTANCE_HIGH,
-            ).apply {
-                description = context.getString(R.string.channel_messages_description)
-                enableVibration(true)
-            },
+        ensureChannel(
+            manager, CHANNEL_MESSAGES, R.string.channel_messages,
+            R.string.channel_messages_description, NotificationManager.IMPORTANCE_HIGH, ALERT_PATTERN,
         )
+        ensureChannel(
+            manager, CHANNEL_STATUS, R.string.channel_status,
+            R.string.channel_status_description, NotificationManager.IMPORTANCE_LOW, null,
+        )
+    }
+
+    /**
+     * Create a channel, or recreate it when a setting Android will not let us
+     * change in place differs.
+     *
+     * A channel's vibration pattern is fixed at creation: an app may rename and
+     * re-describe a channel later, but not change how it buzzes, so an installed
+     * app would keep the old pattern forever. Deleting and recreating costs the
+     * user's per-channel customisation once, and is the only way an upgrade
+     * actually reaches a watch that already has the channel.
+     */
+    private fun ensureChannel(
+        manager: NotificationManager,
+        id: String,
+        nameRes: Int,
+        descRes: Int,
+        importance: Int,
+        pattern: LongArray?,
+    ) {
+        val existing = manager.getNotificationChannel(id)
+        if (existing != null) {
+            val current = existing.vibrationPattern
+            val matches = if (pattern == null) current == null else current != null && current.contentEquals(pattern)
+            if (matches) return
+            manager.deleteNotificationChannel(id)
+        }
         manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_STATUS,
-                context.getString(R.string.channel_status),
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = context.getString(R.string.channel_status_description)
-                setShowBadge(false)
+            NotificationChannel(id, context.getString(nameRes), importance).apply {
+                description = context.getString(descRes)
+                if (pattern == null) {
+                    setShowBadge(false)
+                } else {
+                    enableVibration(true)
+                    vibrationPattern = pattern
+                }
             },
         )
     }
@@ -139,6 +159,32 @@ class Notifier(private val context: Context) {
         notify(MESSAGE_NOTIFICATION_ID, notification)
     }
 
+    /**
+     * The agent stopped working: the end of a turn, or of the session.
+     *
+     * Opt-in on the host (`extra.notify_turn_finished`), because it is one buzz
+     * per turn -- wanted when you are waiting on a long job, noise otherwise.
+     * Reuses the notifications channel so there is one mute switch for
+     * everything Hermes says, and its own id so it does not overwrite a message.
+     */
+    fun showTurnFinished(reason: String?) {
+        val clean = (reason ?: "").trim()
+        val body = if (clean.isEmpty() || clean == "completed") {
+            context.getString(R.string.turn_finished_body)
+        } else {
+            context.getString(R.string.turn_stopped_body, clean)
+        }
+        val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_hermes)
+            .setContentTitle(context.getString(R.string.title_turn_finished))
+            .setContentText(body)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(contentIntent())
+            .build()
+        notify(TURN_NOTIFICATION_ID, notification)
+    }
+
     fun clearApproval() {
         NotificationManagerCompat.from(context).cancel(APPROVAL_NOTIFICATION_ID)
     }
@@ -205,6 +251,17 @@ class Notifier(private val context: Context) {
         const val QUESTION_NOTIFICATION_ID = 1002
         const val LINK_NOTIFICATION_ID = 1003
         const val MESSAGE_NOTIFICATION_ID = 1004
+        const val TURN_NOTIFICATION_ID = 1005
+
+        /**
+         * A double buzz: two short pulses rather than one.
+         *
+         * Set on the channel, not on the notification: from Android 8 the
+         * channel owns vibration, so a pattern passed to the notification is
+         * ignored. It is what makes a Hermes alert feel different from a chat
+         * message in the wrist-blind moment that matters.
+         */
+        val ALERT_PATTERN = longArrayOf(0L, 220L, 120L, 220L)
         const val FOREGROUND_NOTIFICATION_ID = 1000
     }
 }

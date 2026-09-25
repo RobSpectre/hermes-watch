@@ -14,6 +14,9 @@
     <string name="channel_messages">Notifications</string>
     <string name="channel_messages_description">Messages Hermes sends to your watch</string>
     <string name="title_message">Hermes</string>
+    <string name="title_turn_finished">Hermes finished</string>
+    <string name="turn_finished_body">The agent is done with its turn</string>
+    <string name="turn_stopped_body">The agent stopped: %1$s</string>
     <string name="pairing_title">Pair with bridge</string>
     <string name="pairing_host">Bridge host</string>
     <string name="pairing_port">Port</string>
