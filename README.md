@@ -1,5 +1,8 @@
 # Hermes Watch
 
+[![bridge](https://github.com/RobSpectre/hermes-watch/actions/workflows/bridge-ci.yml/badge.svg)](https://github.com/RobSpectre/hermes-watch/actions/workflows/bridge-ci.yml)
+[![watch](https://github.com/RobSpectre/hermes-watch/actions/workflows/watch-ci.yml/badge.svg)](https://github.com/RobSpectre/hermes-watch/actions/workflows/watch-ci.yml)
+
 Your agent, on your wrist. A Wear OS app for the Pixel Watch that tells you when
 Hermes Agent is **waiting for you** — and lets you answer from the watch — plus a
 live readout of how the run is actually going: tokens per second, context
