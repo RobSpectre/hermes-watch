@@ -4,7 +4,7 @@
 
 | Path | What it is |
 |---|---|
-| `bridge/hermes_watch/` | The Python half: protocol, stats, hub, daemon, Hermes plugin, CLI |
+| `bridge/hermes_watch/` | The Python half: protocol, the gateway platform adapter, plugin hooks, the in-process bus, stats, CLI |
 | `bridge/tests/` | pytest — the authoritative check on the wire contract |
 | `bridge/tools/fake_watch.py` | A terminal stand-in for the watch; use it instead of a device |
 | `watch/app/` | The Wear OS app (Kotlin, Compose for Wear) |
@@ -16,23 +16,27 @@
 ```bash
 # bridge
 python -m venv .venv && . .venv/bin/activate
-pip install -e ./bridge pytest pytest-asyncio
+uv pip install -e "./bridge[dev]"
 cd bridge && pytest -q
 
 # watch
 cd watch && gradle wrapper --gradle-version 8.9 && ./gradlew :app:assembleDebug
 ```
 
-Run the end-to-end loop by hand before opening a PR that touches the protocol or
-the approval path:
+`test_platform.py` and `test_watch_contract.py` need a Hermes installation on the
+path (they skip without one, and CI has none); `conftest.py` finds
+`$HERMES_HOME/hermes-agent` or `~/.hermes/hermes-agent` automatically. To run the
+whole thing against a real gateway instead of the in-process harness:
 
 ```bash
-hermes-watch-bridge serve &
-python bridge/tools/fake_watch.py --answer once &   # answers the first approval
-curl -s -X POST http://127.0.0.1:8788/v1/pending \
-  -H "Authorization: Bearer $(hermes-watch-bridge token --show)" \
-  -d '{"kind":"approval","id":"apv_x","timeout":30,"choices":["once","deny"],"payload":{"command":"rm -rf /tmp/x"}}'
+# in another terminal, with the platform enabled and the gateway running:
+python bridge/tools/fake_watch.py --pair          # triggers the pairing code
+python bridge/tools/fake_watch.py --answer once   # answers the first approval
 ```
+
+A watch prompt with nobody to answer it is best exercised through the tests: they
+post to `/event`, watch the frame arrive, and assert the response. Doing it by
+hand means racing a real human.
 
 ## Rules that are not negotiable
 
@@ -57,8 +61,12 @@ approve", which is worse than any bug that just breaks the display.
    client that refuses to guess.
 6. **No transcript content over the wire.** Tool names, counts, ids, and the
    already-redacted approval command. Not tool arguments, not message bodies.
-7. **Read `state.db` read-only.** The bridge must never be able to damage a live
+7. **Read `state.db` read-only.** Nothing in this project may damage a live
    agent's history.
+8. **The adapter is a guest in the gateway process.** It must not raise out of a
+   `BasePlatformAdapter` callback, must not hold a file descriptor before
+   `connect()`, and must treat a watch disconnecting as `send_path_degraded`, not
+   as the platform going down.
 
 ## Tests
 
@@ -66,8 +74,12 @@ approve", which is worse than any bug that just breaks the display.
   `docs/protocol.md`, in the same PR.
 * Stats change → a test in `test_stats.py` that pins the label (`live`,
   `live_approximate`, `db_estimate`) as well as the number.
-* Approval-path change → a test in `test_daemon.py` (real sockets) and
-  `test_plugin.py` (fail-closed semantics).
+* Anything the watch parses → `test_watch_contract.py`, which speaks the app's
+  exact frames. It is the only thing standing between a refactor and a broken
+  watch in the field.
+* Approval-path change → a test in `test_platform.py` (real sockets, both the
+  gateway-native and the out-of-process path) and `test_plugin.py` (fail-closed
+  semantics).
 * App change → it should at least still compile; CI runs `assembleDebug` on every
   PR touching `watch/`.
 

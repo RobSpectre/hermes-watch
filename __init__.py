@@ -8,10 +8,11 @@ implementation in ``bridge/hermes_watch/plugin.py``.
 Install either way::
 
     hermes plugins install RobSpectre/hermes-watch --enable   # plugin path
-    pip install ./bridge                                      # daemon + CLI path
+    pip install ./bridge                                      # optional: CLI only
 
-The ``sys.path`` insertion is what lets the plugin work from a plain
-``git clone`` into ``~/.hermes/plugins/`` with no install step.
+The plugin path needs no install step at all: the ``sys.path`` insertion below is
+what lets it work from a plain ``git clone`` into ``~/.hermes/plugins/``. The pip
+install exists for the standalone ``hermes-watch stats|doctor`` commands.
 """
 
 from __future__ import annotations

@@ -1,24 +1,38 @@
 # Wire protocol v1
 
-Normative contract between the bridge daemon and a Wear OS client. The
+Normative contract between the **watch listener** and a Wear OS client. The
 implementation is [`bridge/hermes_watch/protocol.py`](../bridge/hermes_watch/protocol.py);
 the Kotlin side is [`watch/app/src/main/java/.../data/Protocol.kt`](../watch/app/src/main/java/com/nousresearch/hermeswatch/data/Protocol.kt).
 If this document and the code disagree, the code's tests
-(`bridge/tests/test_protocol.py`) decide — and this document is wrong.
+(`bridge/tests/test_protocol.py` and `bridge/tests/test_watch_contract.py`)
+decide — and this document is wrong.
+
+The watch app is built and released separately, so treat everything below as
+**frozen**: additions only, and `bridge/tests/test_watch_contract.py` speaks the
+app's exact frames to prove it. If those tests fail, watches in the field break.
 
 ## Transport
 
 | | |
 |---|---|
-| Watch → bridge | `ws://<host>:<watch_port>/v1/watch?token=<pairing-token>&device=<label>` |
-| Plugin → bridge | `http://127.0.0.1:<ingest_port>/v1/...` with `Authorization: Bearer <pairing-token>` |
+| Watch → listener | `ws://<host>:<port>/v1/watch?device=<label>` (the app also sends `&token=…`, ignored) |
+| Plugin → listener | `POST http://127.0.0.1:<port>/event` (loopback; optional `ingest_token` in `extra` for a shared secret) |
+| Liveness | `GET http://<host>:<port>/healthz` — no auth, no data, just `{ok, state, watches, authorized}` |
 | Encoding | One JSON object per WebSocket **text** frame. No batching, no newline framing. |
-| Heartbeat | Standard WebSocket ping/pong, 30 s, driven by the bridge. |
+| Heartbeat | Standard WebSocket ping/pong, 30 s, driven by the listener; a `ping` JSON frame every 30 s, answered by the app with `pong`. |
 | Max frame | 64 KiB client→server, server frames are small by construction. |
 
-The pairing token is one secret for both listeners. It is generated on first run
-at `$HERMES_HOME/hermes-watch/token` (mode 0600) and rotated with
-`hermes-watch-bridge token --rotate`.
+**There is no shared secret.** Access is granted by Hermes' own pairing store:
+the socket is accepted, the device is told it is unpaired, one message from it
+triggers Hermes' standard unauthorized-device reply with an 8-character code,
+and the owner approves it on the host with
+`hermes pairing approve pixel_watch <code>`. The `token` query parameter is a
+relic of the pre-gateway design and is accepted-and-ignored so older app builds
+keep working.
+
+Pairing is keyed on the connection's **device identity**, which is the
+`device` query parameter if present, else the hello's `label` (the app sends
+both, with the same value).
 
 ## Versioning
 

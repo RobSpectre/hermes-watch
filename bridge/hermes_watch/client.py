@@ -1,11 +1,18 @@
-"""Thin synchronous client the Hermes plugin uses to reach the daemon.
+"""Thin synchronous client the plugin half uses to reach the watch adapter.
 
 Standard library only (``urllib.request``). That is a hard requirement, not a
-preference: this code is imported into a *live Hermes process*, so it must not
-add an import-time dependency, must not touch the event loop, and must never
-raise into the agent. Every public method swallows transport failures and
-returns a neutral value -- a bridge that is down degrades the watch, never the
-agent.
+preference: this module is imported into a *live Hermes process* -- often a CLI
+session, where the module is loaded on every start -- so it must add no
+import-time dependency, must not touch the event loop, and must never raise into
+the agent. Every method swallows transport failures and returns a neutral
+value. A watch that is unreachable degrades the watch, never the agent.
+
+There are exactly two things the plugin can say to the adapter:
+
+* ``post_event`` -- a lifecycle observation. Fire and forget.
+* ``ask`` -- "a human must decide this, tell me what the watch said". The HTTP
+  request *is* the pending state: it stays open until the watch answers or the
+  budget expires, so neither side needs a registry, a sweeper, or a callback.
 """
 
 from __future__ import annotations
@@ -18,18 +25,21 @@ from typing import Any, Optional
 
 log = logging.getLogger("hermes_watch.client")
 
-#: Short on purpose. Events are fire-and-forget; a slow daemon must not turn
-#: into slow tool calls. The approval path uses its own, longer budget.
+#: Short on purpose: observations are fire-and-forget, and a wedged listener
+#: must not turn into a slow tool call.
 EVENT_TIMEOUT = 2.0
+#: Grace on top of the caller's own budget, so the adapter's timeout (which
+#: fails closed) is the one that decides, not a socket timeout.
+ASK_GRACE = 5.0
 
 
-class BridgeClient:
-    """Blocking HTTP client for the bridge daemon's loopback ingest API."""
+class AdapterClient:
+    """Blocking HTTP client for the watch adapter's loopback API."""
 
-    def __init__(self, base_url: str, token: str = "", *, timeout: float = EVENT_TIMEOUT):
+    def __init__(self, base_url: str, *, timeout: float = EVENT_TIMEOUT, token: str = "") -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
         self.timeout = timeout
+        self.token = token
 
     # -- plumbing ------------------------------------------------------------
 
@@ -51,38 +61,28 @@ class BridgeClient:
             with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
                 body = response.read().decode("utf-8")
                 return json.loads(body) if body else {}
-        except urllib.error.HTTPError as exc:
-            # 202 on the long-poll is "not answered yet", not an error.
-            if exc.code == 202:
-                try:
-                    return json.loads(exc.read().decode("utf-8"))
-                except Exception:
-                    return {"ok": False, "error": "not_answered"}
-            log.debug("bridge %s %s -> HTTP %s", method, path, exc.code)
-            return None
         except Exception as exc:
-            log.debug("bridge %s %s failed: %s", method, path, exc)
+            # Includes HTTPError, URLError, socket timeouts and a gateway that is
+            # simply not running. Every one of them means "no watch path", which
+            # the caller handles by falling back to Hermes' own prompt.
+            log.debug("watch %s %s failed: %s", method, path, exc)
             return None
 
     # -- fire and forget -----------------------------------------------------
 
     def post_event(self, event: str, payload: Optional[dict] = None) -> bool:
-        body: dict[str, Any] = {"event": event, "payload": payload or {}}
-        return self._request("POST", "/v1/event", body) is not None
-
-    def post_stats(self, **fields: Any) -> bool:
-        """Report exact per-call measurements (durations, usage, context window)."""
-        clean = {k: v for k, v in fields.items() if v is not None}
-        if not clean:
-            return False
-        return self._request("POST", "/v1/stats", clean) is not None
+        """Report one lifecycle observation. False when nothing is listening."""
+        return self._request("POST", "/event", {"event": event, "payload": payload or {}}) is not None
 
     def health(self) -> Optional[dict]:
         return self._request("GET", "/healthz")
 
-    # -- blocking attention --------------------------------------------------
+    def reachable(self) -> bool:
+        return self.health() is not None
 
-    def open_request(
+    # -- blocking human input -------------------------------------------------
+
+    def ask(
         self,
         kind: str,
         payload: dict,
@@ -90,29 +90,25 @@ class BridgeClient:
         choices: tuple[str, ...] = (),
         timeout: float = 300.0,
         pending_id: Optional[str] = None,
-    ) -> Optional[dict]:
-        body = {
-            "kind": kind,
+    ) -> Optional[str]:
+        """Ask the watch and block until it answers.
+
+        Returns the chosen string, or None when the watch is unreachable, the
+        device is not paired, nobody answered in time, or the frame was refused.
+        None always means *no human answered* -- callers treat it as failure and
+        let Hermes fall back to its own prompt, so a watch that is off can never
+        turn into a silent denial of a command the user would have approved.
+        """
+        event = "approval.requested" if kind == "approval" else "question.pending"
+        body: dict[str, Any] = {
+            "event": event,
             "payload": payload,
             "choices": list(choices),
             "timeout": timeout,
             "id": pending_id,
         }
-        return self._request("POST", "/v1/pending", body)
-
-    def wait_for_answer(self, pending_id: str, *, timeout: float) -> Optional[dict]:
-        return self._request("GET", f"/v1/pending/{pending_id}?timeout={timeout}", timeout=timeout + 5.0)
-
-    def resolve(self, pending_id: str, resolution: Optional[str], *, responder: str = "hermes") -> bool:
-        return (
-            self._request(
-                "POST",
-                f"/v1/pending/{pending_id}/resolve",
-                {"id": pending_id, "resolution": resolution, "responder": responder},
-            )
-            is not None
-        )
-
-    def answered_by_watch(self, delivered: int) -> bool:
-        """Whether any watch was connected when the request was opened."""
-        return delivered > 0
+        response = self._request("POST", "/event", body, timeout=timeout + ASK_GRACE)
+        if not response or not response.get("ok"):
+            return None
+        choice = response.get("choice")
+        return choice if isinstance(choice, str) and choice else None

@@ -1,243 +1,373 @@
-"""The Hermes-side plugin: fail closed, never block, never raise into the agent.
+"""The plugin half: hooks in, watch observations out, approvals routed.
 
-These tests exercise the plugin against a fake client, because the failure modes
-that matter are the ones where the bridge is *absent* or *hostile* rather than
-the happy path (covered end to end in ``test_daemon.py``).
+Two failure modes matter here, and both are absences rather than errors:
+
+* **Nothing blocks the agent.** Hook callbacks run inside a live turn, so every
+  notification is queued, and a transport that throws is somebody else's turn
+  to handle.
+* **Nothing answers for the human.** When no watch answers, the transport raises
+  so Hermes falls back to its own prompt, instead of leaving a dangerous command
+  silently unanswered.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import importlib.util
+from typing import Any, Optional
 
 import pytest
 
 from hermes_watch import protocol as p
-from hermes_watch.plugin import WatchBridgePlugin, WatchUnavailable, register
+from hermes_watch.live import bus
+from hermes_watch.plugin import (
+    TRANSPORT_NAME,
+    WatchPlugin,
+    WatchUnavailable,
+    _clip,
+    _usage_field,
+    register,
+)
+
+
+class _ImmediateDispatcher:
+    """Runs tasks inline so tests do not race a background thread.
+
+    Like the real worker it contains a failing task rather than letting it
+    escape, but it remembers the failure so a test can assert the task really
+    did blow up instead of quietly doing nothing.
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[BaseException] = []
+
+    def submit(self, task) -> None:
+        try:
+            task()
+        except BaseException as exc:  # noqa: BLE001
+            self.errors.append(exc)
 
 
 class FakeRequest:
-    """Stand-in for ``hermes_cli.approval_transport.ApprovalRequest``."""
+    """Stands in for Hermes' ``ApprovalRequest``."""
 
-    def __init__(self, choices=("once", "session", "deny"), timeout=300.0):
-        self.request_id = "abcdef0123456789"
-        self.digest = "digest"
-        self.command = "rm -rf /tmp/scratch"
+    def __init__(self, choices=("once", "session", "deny"), timeout=300.0, request_id="req-1"):
+        self.command = "rm -rf ~/build/cache"
         self.description = "recursive delete"
-        self.pattern_key = "rm_rf"
-        self.pattern_keys = ("rm_rf",)
+        self.pattern_key = "rm:-rf"
         self.surface = "cli"
+        self.tool_call_id = "call_1"
+        self.request_id = request_id
         self.timeout_seconds = timeout
         self.allowed_choices = choices
-        self.tool_call_id = "call_1"
+        self.responses: list[str] = []
 
     def respond(self, choice: str):
-        return ("decision", self.request_id, self.digest, choice)
+        self.responses.append(choice)
+        return {"choice": choice}
 
 
 class FakeClient:
-    def __init__(self, *, reachable=True, delivered=1, answer=None):
-        self.base_url = "http://127.0.0.1:8788"
+    """Stands in for :class:`hermes_watch.client.AdapterClient`."""
+
+    def __init__(self, *, reachable=True, answer: Optional[str] = None, post_ok=True):
         self.reachable = reachable
-        self.delivered = delivered
         self.answer = answer
-        self.calls: list[tuple[str, Any]] = []
+        self.post_ok = post_ok
+        self.posts: list[tuple[str, dict]] = []
+        self.asks: list[dict] = []
 
-    def post_event(self, event, payload=None):
-        self.calls.append(("event", event, payload))
-        return self.reachable
+    def post_event(self, event: str, payload: Optional[dict] = None) -> bool:
+        self.posts.append((event, payload or {}))
+        return self.post_ok
 
-    def post_stats(self, **fields):
-        self.calls.append(("stats", fields))
-        return self.reachable
+    def health(self):
+        return {"ok": True} if self.reachable else None
 
-    def open_request(self, kind, payload, *, choices=(), timeout=300.0, pending_id=None):
-        self.calls.append(("open", {"kind": kind, "choices": choices, "id": pending_id}))
-        if not self.reachable:
-            return None
-        return {"ok": True, "id": pending_id, "delivered": self.delivered}
-
-    def wait_for_answer(self, pending_id, *, timeout):
-        self.calls.append(("wait", pending_id))
+    def ask(self, kind, payload, *, choices=(), timeout=300.0, pending_id=None) -> Optional[str]:
+        self.asks.append({"kind": kind, "payload": payload, "choices": choices,
+                          "timeout": timeout, "pending_id": pending_id})
         return self.answer
 
-    def resolve(self, pending_id, resolution, *, responder="hermes"):
-        self.calls.append(("resolve", {"id": pending_id, "resolution": resolution, "responder": responder}))
-        return self.reachable
 
-    def answered_by_watch(self, delivered):
-        return delivered > 0
+class FakeContext:
+    """Stands in for ``PluginContext``, recording what got registered."""
+
+    def __init__(self):
+        self.hooks: list[tuple[str, Any]] = []
+        self.transports: list[tuple[str, Any]] = []
+        self.platforms: list[dict] = []
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
+
+    def register_approval_transport(self, name, callback):
+        self.transports.append((name, callback))
+
+    def register_platform(self, **kwargs):
+        self.platforms.append(kwargs)
 
 
-def plugin(client: FakeClient) -> WatchBridgePlugin:
-    instance = WatchBridgePlugin.__new__(WatchBridgePlugin)  # bypass config/threading setup
-    from hermes_watch.plugin import _Dispatcher
-
-    instance.ctx = None
-    instance.client = client
-    instance.dispatcher = _Dispatcher()
-    instance._context_windows = {}
-    instance._turn_seen = {}
-
-    class Config:
-        approval_timeout_s = 300.0
-        notify_questions = True
-
-    instance.config = Config()
+@pytest.fixture
+def plugin(monkeypatch) -> WatchPlugin:
+    """A plugin wired to a fake client, with nothing subscribed to the bus."""
+    monkeypatch.setattr(bus, "_handlers", [])
+    instance = WatchPlugin(ctx=FakeContext())
+    instance.client = FakeClient()
+    instance.dispatcher = _ImmediateDispatcher()
     return instance
 
 
-def test_watch_answer_becomes_a_bound_decision():
-    client = FakeClient(answer={"ok": True, "resolution": "once", "responder": "watch"})
-    decision = plugin(client).present_approval(FakeRequest())
-    assert decision == ("decision", "abcdef0123456789", "digest", "once")
-    opened = next(call for call in client.calls if call[0] == "open")[1]
-    # The watch is offered exactly the scopes Hermes offered, no more.
-    assert opened["choices"] == ("once", "session", "deny")
-    assert opened["id"] == "apv_abcdef0123456789"
+@pytest.fixture
+def offline(monkeypatch):
+    """Builds a plugin whose watch path is down."""
+
+    def make(**client_kwargs) -> WatchPlugin:
+        monkeypatch.setattr(bus, "_handlers", [])
+        instance = WatchPlugin(ctx=FakeContext())
+        instance.client = FakeClient(**client_kwargs)
+        instance.dispatcher = _ImmediateDispatcher()
+        return instance
+
+    return make
 
 
-def test_denial_on_the_watch_is_honoured():
-    client = FakeClient(answer={"ok": True, "resolution": "deny", "responder": "watch"})
-    assert plugin(client).present_approval(FakeRequest())[-1] == "deny"
+# --- approvals --------------------------------------------------------------
 
 
-def test_unreachable_bridge_fails_closed_and_defers_to_the_builtin_prompt():
-    client = FakeClient(reachable=False)
+def test_watch_answer_becomes_the_transport_decision(plugin):
+    plugin.client = FakeClient(answer="once")
+    assert plugin.present_approval(FakeRequest()) == {"choice": "once"}
+
+
+def test_the_choice_the_watch_made_is_the_one_sent_back(plugin):
+    plugin.client = FakeClient(answer="session")
+    request = FakeRequest(choices=("once", "session", "always", "deny"))
+    plugin.present_approval(request)
+    assert request.responses == ["session"]
+
+
+def test_the_watch_is_offered_exactly_the_scopes_hermes_offered(plugin):
+    plugin.client = FakeClient(answer="once")
+    plugin.present_approval(FakeRequest(choices=("once", "deny")))
+    assert plugin.client.asks[0]["choices"] == ("once", "deny")
+    assert plugin.client.asks[0]["pending_id"] == "apv_req-1"
+
+
+def test_unreachable_watch_defers_to_hermes_own_prompt(offline):
+    """A watch that is off must not become a silent denial."""
     with pytest.raises(WatchUnavailable):
-        plugin(client).present_approval(FakeRequest())
+        offline(reachable=False, post_ok=False).present_approval(FakeRequest())
 
 
-def test_no_connected_watch_fails_closed_without_waiting():
-    client = FakeClient(delivered=0)
-    with pytest.raises(WatchUnavailable, match="no watch"):
-        plugin(client).present_approval(FakeRequest())
-    # The request must be withdrawn so a later watch connection cannot answer a
-    # question the human already saw somewhere else.
-    assert any(call[0] == "resolve" and call[1]["resolution"] is None for call in client.calls)
-    assert not any(call[0] == "wait" for call in client.calls)
+def test_no_answer_defers_to_hermes_own_prompt(plugin):
+    plugin.client = FakeClient(answer=None)
+    with pytest.raises(WatchUnavailable):
+        plugin.present_approval(FakeRequest())
 
 
-def test_unanswered_request_becomes_a_denial_not_a_hang():
-    client = FakeClient(answer={"ok": False, "error": "not_answered"})
-    assert plugin(client).present_approval(FakeRequest())[-1] == "deny"
+def test_an_off_menu_answer_defers_rather_than_widening_scope(plugin):
+    """``always`` was never offered; honouring it would make a one-shot permanent."""
+    plugin.client = FakeClient(answer="always")
+    with pytest.raises(WatchUnavailable):
+        plugin.present_approval(FakeRequest(choices=("once", "deny")))
 
 
-def test_a_resolution_outside_the_offered_scopes_is_downgraded_to_deny():
-    client = FakeClient(answer={"ok": True, "resolution": "always", "responder": "watch"})
-    # `always` was not offered (once/session/deny), so it must not be granted.
-    assert plugin(client).present_approval(FakeRequest(choices=("once", "session", "deny")))[-1] == "deny"
+def test_the_approval_never_leaks_session_keys_to_the_watch(plugin):
+    plugin.client = FakeClient(answer="once")
+    plugin.present_approval(FakeRequest())
+    payload = plugin.client.asks[0]["payload"]
+    assert "session_key" not in payload
+    assert payload["command"] == "rm -rf ~/build/cache"
 
 
-def test_api_hooks_report_exact_measurements():
-    client = FakeClient()
-    instance = plugin(client)
-    instance.on_pre_api_request(
+def test_a_client_that_throws_still_yields_the_documented_signal(plugin, monkeypatch):
+    """Any transport fault has to look like ``no watch``, not like a crash."""
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("socket exploded")
+
+    plugin.client = FakeClient()
+    monkeypatch.setattr(plugin.client, "ask", explode)
+    with pytest.raises(WatchUnavailable):
+        plugin.present_approval(FakeRequest())
+
+
+# --- observation routing ----------------------------------------------------
+
+
+def test_observations_go_to_the_bus_when_an_adapter_is_colocated(plugin):
+    seen: list[tuple[str, dict]] = []
+    bus.subscribe(lambda name, payload: seen.append((name, payload)))
+    try:
+        plugin.observe(p.E_TURN_STARTED, turn_id="t1")
+    finally:
+        bus._handlers.clear()
+    assert seen == [(p.E_TURN_STARTED, {"turn_id": "t1"})]
+    # Co-located: nothing went over the wire, because it did not have to.
+    assert plugin.client.posts == []
+
+
+def test_observations_are_posted_when_no_adapter_is_here(plugin):
+    plugin.observe(p.E_TOOL_STARTED, tool_name="terminal")
+    assert plugin.client.posts == [(p.E_TOOL_STARTED, {"tool_name": "terminal"})]
+
+
+def test_none_fields_are_dropped_before_they_leave_the_process(plugin):
+    """A None would erase a good earlier reading at the far end."""
+    plugin.observe("api_request", output_tokens=10, api_duration=None)
+    assert plugin.client.posts == [("api_request", {"output_tokens": 10})]
+
+
+def test_a_failing_post_is_not_raised(offline):
+    offline(post_ok=False).observe(p.E_TURN_STARTED, turn_id="t1")  # must not raise
+
+
+# --- hooks ------------------------------------------------------------------
+
+
+def test_api_hooks_report_exact_measurements(plugin):
+    plugin.on_pre_api_request(
         model="test/model-1", base_url="http://localhost", provider="test",
-        api_call_count=2, approx_input_tokens=12_000, turn_id="t1", session_id="s1",
+        turn_id="t1", session_id="s1", approx_input_tokens=12_000,
     )
-    instance.on_post_api_request(
-        model="test/model-1", response_model="test/model-1", api_call_count=2, api_duration=2.0,
+    plugin.on_post_api_request(
+        model="test/model-1", api_call_count=1, api_duration=2.0,
         usage={"prompt_tokens": 12_100, "completion_tokens": 400, "reasoning_tokens": 90},
     )
-    instance.dispatcher._queue.join()
-    stats = [call[1] for call in client.calls if call[0] == "stats"]
-    assert stats[0]["approx_input_tokens"] == 12_000
-    assert stats[1]["api_duration"] == 2.0
-    assert stats[1]["output_tokens"] == 400
-    assert stats[1]["prompt_tokens"] == 12_100
-    assert stats[1]["reasoning_tokens"] == 90
-    assert any(call[0] == "event" and call[1] == p.E_TURN_STARTED for call in client.calls)
+    names = [name for name, _ in plugin.client.posts]
+    assert p.E_TURN_STARTED in names
+    measured = [payload for name, payload in plugin.client.posts if name == "api_request"][-1]
+    assert (measured["output_tokens"], measured["api_duration"]) == (400, 2.0)
+    assert measured["prompt_tokens"] == 12_100
+    assert measured["reasoning_tokens"] == 90
+
+
+def test_a_turn_start_is_reported_once_per_turn(plugin):
+    for _ in range(3):
+        plugin.on_pre_api_request(model="m", base_url="", provider="", turn_id="t1")
+    assert [name for name, _ in plugin.client.posts].count(p.E_TURN_STARTED) == 1
 
 
 def test_usage_objects_are_read_from_dicts_or_dataclasses():
     class Usage:
-        prompt_tokens = 500
-        completion_tokens = 60
+        completion_tokens = 42
 
-    client = FakeClient()
-    instance = plugin(client)
-    instance.on_post_api_request(model="m", api_duration=1.0, usage=Usage())
-    instance.dispatcher._queue.join()
-    stats = [call[1] for call in client.calls if call[0] == "stats"][-1]
-    assert (stats["prompt_tokens"], stats["output_tokens"]) == (500, 60)
+    assert _usage_field({"completion_tokens": 7}, "completion_tokens") == 7
+    assert _usage_field(Usage(), "completion_tokens") == 42
+    assert _usage_field(None, "completion_tokens") is None
 
 
-def test_clarify_notifies_the_watch_but_never_answers_for_the_human():
-    client = FakeClient()
-    instance = plugin(client)
-    instance.on_pre_tool_call(tool_name="clarify", args={"question": "Deploy to prod?"}, turn_id="t1")
-    instance.dispatcher._queue.join()
-    events = [call[1] for call in client.calls if call[0] == "event"]
-    assert p.E_QUESTION_PENDING in events
-    assert not any(call[0] in ("open", "wait") for call in client.calls)
+def test_clarify_notifies_the_watch_without_answering_for_the_human(plugin):
+    plugin.on_pre_tool_call(tool_name="clarify", args={"question": "Deploy where?"}, turn_id="t1")
+    pending = [payload for name, payload in plugin.client.posts if name == p.E_QUESTION_PENDING]
+    assert pending and pending[0]["question"] == "Deploy where?"
+    # The CLI has no inbound transport for a question, so nothing was asked back.
+    assert plugin.client.asks == []
 
 
-def test_question_text_is_clipped_before_it_leaves_the_process():
-    client = FakeClient()
-    instance = plugin(client)
-    instance.on_pre_tool_call(tool_name="clarify", args={"question": "x" * 5000})
-    instance.dispatcher._queue.join()
-    payload = next(call[2] for call in client.calls if call[0] == "event" and call[1] == p.E_QUESTION_PENDING)
+def test_question_text_is_clipped_before_it_leaves_the_process(plugin):
+    plugin.on_pre_tool_call(tool_name="clarify", args={"question": "x" * 5_000})
+    payload = [payload for name, payload in plugin.client.posts if name == p.E_QUESTION_PENDING][0]
     assert len(payload["question"]) == 240
 
 
-def test_tool_arguments_are_never_forwarded():
-    client = FakeClient()
-    instance = plugin(client)
-    instance.on_pre_tool_call(
-        tool_name="terminal", args={"command": "curl -H 'Authorization: Bearer hunter2'"},
+def test_tool_arguments_are_never_forwarded(plugin):
+    plugin.on_pre_tool_call(
+        tool_name="terminal",
+        args={"command": "curl -H 'Authorization: Bearer hunter2'"},
         turn_id="t1", tool_call_id="c1",
     )
-    instance.dispatcher._queue.join()
-    for call in client.calls:
-        assert "hunter2" not in repr(call)
-    payload = next(call[2] for call in client.calls if call[0] == "event" and call[1] == p.E_TOOL_STARTED)
+    for _, payload in plugin.client.posts:
+        assert "hunter2" not in repr(payload)
+    started = [payload for name, payload in plugin.client.posts if name == p.E_TOOL_STARTED][0]
     # Names, ids and counts only -- never a tool's arguments.
-    assert payload == {"tool_name": "terminal", "turn_id": "t1", "tool_call_id": "c1"}
+    assert started == {"tool_name": "terminal", "turn_id": "t1", "tool_call_id": "c1"}
 
 
-def test_approval_resolution_on_another_surface_clears_the_watch_prompt():
-    client = FakeClient()
-    instance = plugin(client)
-    from hermes_watch import plugin as plugin_module
+def test_a_hook_never_raises_when_the_client_is_broken(plugin, monkeypatch):
+    def explode(*args, **kwargs):
+        raise RuntimeError("boom")
 
-    plugin_module._open_approvals["apv_x"] = "call_1"
-    instance.on_post_approval_response(tool_call_id="call_1", choice="deny", surface="cli")
-    instance.dispatcher._queue.join()
-    assert any(
-        call[0] == "resolve" and call[1]["id"] == "apv_x" and call[1]["resolution"] == "deny"
-        for call in client.calls
-    )
+    monkeypatch.setattr(plugin.client, "post_event", explode)
+    # The hook returns and the agent's turn is untouched; the failure stayed in
+    # the dispatcher where it started.
+    plugin.on_session_start(session_id="s1")
+    assert len(plugin.dispatcher.errors) == 1
+    assert isinstance(plugin.dispatcher.errors[0], RuntimeError)
 
 
-def test_register_never_raises_even_when_the_plugin_manager_is_hostile():
-    class HostileContext:
-        def register_hook(self, *args, **kwargs):
-            raise RuntimeError("nope")
-
-        def register_approval_transport(self, *args, **kwargs):
-            raise RuntimeError("nope")
-
-    register(HostileContext())  # must not propagate
+def test_an_approval_settled_elsewhere_clears_the_watch_card(plugin):
+    plugin._open_approvals["apv_x"] = "call_1"
+    plugin.on_post_approval_response(tool_call_id="call_1", choice="deny", surface="cli")
+    resolved = [payload for name, payload in plugin.client.posts if name == p.E_APPROVAL_RESOLVED]
+    assert resolved and resolved[0]["id"] == "apv_x" and resolved[0]["choice"] == "deny"
+    assert plugin._open_approvals == {}
 
 
-def test_register_wires_the_expected_hooks():
-    class RecordingContext:
-        def __init__(self):
-            self.hooks = []
-            self.transports = []
+# --- registration -----------------------------------------------------------
 
-        def register_hook(self, name, callback):
-            self.hooks.append((name, callback))
 
-        def register_approval_transport(self, name, callback):
-            self.transports.append((name, callback))
-
-    ctx = RecordingContext()
+def test_register_wires_hooks_transport_and_platform():
+    ctx = FakeContext()
     register(ctx)
-    names = {name for name, _ in ctx.hooks}
     assert {
         "pre_api_request", "post_api_request", "on_session_start", "on_session_end",
-        "agent_loop_stopped", "post_tool_call", "pre_approval_request", "post_approval_response",
-    } <= names
-    assert ctx.transports[0][0] == "pixel-watch"
+        "on_session_finalize", "agent_loop_stopped", "pre_tool_call", "post_tool_call",
+        "pre_approval_request", "post_approval_response",
+    } <= {name for name, _ in ctx.hooks}
+    assert [name for name, _ in ctx.transports] == [TRANSPORT_NAME]
+
+    assert len(ctx.platforms) == 1
+    platform = ctx.platforms[0]
+    assert platform["name"] == "pixel_watch"
+    assert platform["allowed_users_env"] == "HERMES_WATCH_ALLOWED_USERS"
+    assert "wear os watch" in platform["platform_hint"].lower()
+    assert callable(platform["adapter_factory"])
+    assert callable(platform["check_fn"])
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("gateway.platforms.base") is None,
+    reason="needs a Hermes installation",
+)
+def test_the_registered_factory_builds_a_real_adapter():
+    from gateway.config import PlatformConfig
+
+    ctx = FakeContext()
+    register(ctx)
+    adapter = ctx.platforms[0]["adapter_factory"](
+        PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 0})
+    )
+    assert adapter.platform.value == "pixel_watch"
+    assert adapter.name == "Pixel Watch"
+
+
+def test_register_never_raises_on_a_hostile_context():
+    class Hostile:
+        def register_hook(self, *args, **kwargs):
+            raise RuntimeError("no hooks for you")
+
+        def register_approval_transport(self, *args, **kwargs):
+            raise RuntimeError("no transport for you")
+
+        def register_platform(self, **kwargs):
+            raise RuntimeError("no platform for you")
+
+    register(Hostile())  # must return quietly, not take the CLI down
+
+
+def test_register_survives_a_context_with_no_platform_support():
+    """A CLI process may expose a context that cannot register platforms."""
+
+    class ContextWithoutPlatforms(FakeContext):
+        def register_platform(self, **kwargs):
+            raise AttributeError("register_platform")
+
+    ctx = ContextWithoutPlatforms()
+    register(ctx)
+    assert ctx.hooks, "hooks must still be registered"
+
+
+def test_clip_leaves_short_text_alone():
+    assert _clip("short") == "short"
+    assert len(_clip("x" * 500, 100)) == 100

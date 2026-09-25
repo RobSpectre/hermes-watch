@@ -40,10 +40,10 @@ def register(ctx):
 
 Verified contract (from `hermes_cli/approval_transport.py` in v0.21.5):
 
-* `present(request)` may be sync or async. It runs on a bounded daemon worker
+* `present(request)` may be sync or async. It runs on a bounded worker
   thread; async callbacks are awaited with `asyncio.run` **on that worker**, never
-  on the gateway/TUI loop. This project uses a sync callback doing a blocking
-  HTTP long-poll — simplest correct thing.
+  on the gateway/TUI loop. This project uses a sync callback doing one blocking
+  HTTP request that stays open until the watch answers.
 * The request is an immutable `ApprovalRequest` with `request_id`, `digest`,
   `command`, `description`, `pattern_key`, `pattern_keys`, `surface`,
   `timeout_seconds`, `allowed_choices`.
@@ -57,7 +57,44 @@ Verified contract (from `hermes_cli/approval_transport.py` in v0.21.5):
   it is the sanctioned way to say "not me, use something else", which shows the
   normal prompt when `security.approval.transport_fallback: builtin`.
 
-### 3. The session store — `$HERMES_HOME/state.db`
+### 3. Platform adapter — `ctx.register_platform(...)`
+
+The watch socket is hosted by the gateway as a platform (`pixel_watch`), which is
+what lets Hermes own connection lifecycle, pairing, delivery and authorization
+instead of this project reimplementing them. Contracts verified against
+`gateway/platforms/base.py` and `gateway/platform_registry.py` in v0.21.5:
+
+* `register_platform(name, label, adapter_factory, check_fn, ...)` where `name` is
+  a **raw lowercase string**. `Platform("pixel_watch")` resolves through the
+  registry, so no enum change is needed; `platform_registry.register` must be
+  called before any `Platform(...)` lookup for that name.
+* **The adapter never signals "unauthorized".** Authorization is the runner's
+  job: `run_inbound._is_user_authorized_for_source` checks the pairing store, and
+  a DM from an unknown device goes down `generate_code` → the owner runs
+  `hermes pairing approve <platform> <code>`. `PairingStore` is keyed on the same
+  raw string and lives in `~/.hermes/platforms/pairing/`, so a plugin platform
+  gets pairing for free — including `hermes pairing list|approve|revoke`.
+* **Inbound goes through `self.handle_message(MessageEvent(...))`** with a source
+  from `self.build_source(...)`. Bypassing it would skip session guards, profile
+  routing and the delivery ledger.
+* **`connect()` is where you bind.** Holding a socket in `__init__` leaks file
+  descriptors for adapters the runner abandons; a bind failure should call
+  `_set_fatal_error(..., retryable=False)` rather than spin the reconnect watcher.
+  `disconnect()` must be idempotent and end with `_mark_disconnected()`.
+* **A client disconnecting is not the platform disconnecting.** Report
+  `send_path_degraded()` and keep returning `True`.
+* **`enforces_own_access_policy` defaults to False**, so a socket-hosting adapter
+  authenticates its own peers — this one rejects frame answers from unpaired
+  devices and withholds snapshots from them.
+* One adapter instance exists per connection attempt, and each profile binds its
+  own port, so `extra.port` has to be per-profile if you run several.
+
+The platform is registered through a **lazy factory**: the adapter module imports
+gateway machinery, and `kind: platform` plugins are discovered in every process
+including a plain CLI session, so the import happens only when the gateway
+actually builds an adapter.
+
+### 4. The session store — `$HERMES_HOME/state.db`
 
 Opened **read-only** (`file:...?mode=ro`), because the bridge must never be able
 to corrupt a live agent's history. Columns used, all from `sessions`:
@@ -79,16 +116,19 @@ Notes that shaped the code:
   `~/.hermes/profiles/<name>/state.db` under a named profile. Resolve it from
   `$HERMES_HOME`; never hard-code `~/.hermes`.
 
-### 4. Context window — `agent.model_metadata.get_model_context_length`
+### 5. Context window — `agent.model_metadata.get_model_context_length`
 
 Imported lazily inside the plugin, which runs in the agent's process, so the
 full resolution chain applies (config override → provider API → models.dev →
 fallbacks). It is wrapped in `try/except`: a trimmed install or a future rename
 degrades the context percentage to "unknown", never breaks the hook.
 
-The standalone daemon cannot import Hermes, so it reads the cache Hermes writes
-at `$HERMES_HOME/context_length_cache.yaml` (`context_lengths["<model>@<base_url>"]`).
-Narrower, and documented as such.
+Both other readers of this number — the adapter (inside the gateway) and the
+standalone CLI — read the cache Hermes writes at
+`$HERMES_HOME/context_length_cache.yaml` (`context_lengths["<model>@<base_url>"]`).
+Narrower, and documented as such. In practice the plugin's live observation wins
+whenever a turn is running, so this only covers the cold-start case: the adapter
+is up, no plugin has reported anything yet.
 
 ## Surfaces deliberately not used
 
@@ -98,8 +138,12 @@ Narrower, and documented as such.
   a blocking approval to a decision, and would need a second
   `pre_approval_request`-shaped event that isn't in their documented set. The
   plugin gives one code path for both halves.
-* **Gateway platform adapters** (`ctx.register_platform`) — the watch is not a
-  chat platform and does not want a message loop or session routing.
+* ~~**Gateway platform adapters** (`ctx.register_platform`)~~ — **adopted.** The
+  watch *is* registered as a platform (`pixel_watch`), because that is what makes
+  Hermes own the socket, the pairing, the delivery ledger and the authz decision
+  instead of this project reimplementing them. What we do not use from the
+  platform machinery: the message loop is used only for a watch's own messages
+  (which need pairing anyway), and no chat surface is registered.
 * **`ctx.inject_message`** — could push a "your watch said X" into a session, but
   that is a *new user message*, not an approval decision. Wrong tool.
 
@@ -131,5 +175,5 @@ Things that would break this project if they changed upstream, and how it fails:
 | `APPROVAL_CHOICES` renamed | Approvals break | `test_approval_choices_match_the_hermes_approval_transport_contract` fails loudly |
 | Hook payload field renamed | A stat silently becomes "unknown" | Each field is read defensively; the watch shows a dash rather than a zero |
 | `messages.token_count` backfilled | Better context estimate available | `db_estimate` can then be replaced by a real sum; the `source` field already distinguishes methods |
-| `state.db` schema change | Stats go blank | Queries select named columns only; a missing column raises in the daemon, not in Hermes |
+| `state.db` schema change | Stats go blank | Queries select named columns only; a missing column raises where the stats were read (the adapter or the CLI), never inside a Hermes turn |
 | `get_model_context_length` moved | Context % becomes unknown | Guarded import, falls back to the cache file |

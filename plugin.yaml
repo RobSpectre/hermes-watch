@@ -1,3 +1,42 @@
 name: hermes-watch
-version: "0.1.0"
-description: "Push Hermes approvals, questions and live token/context stats to a Wear OS watch."
+label: Hermes Watch
+version: "0.2.0"
+description: >-
+  Hermes on your wrist. A Wear OS watch platform: approval buttons and question
+  chips answered from the watch through Hermes' own prompt machinery, plus live
+  tokens/second, context remaining, session tokens and 30-day totals.
+author: RobSpectre
+kind: platform
+requires_env: []
+optional_env:
+  - name: HERMES_WATCH_ENABLED
+    description: "Set to 1 to enable the watch listener from the environment alone"
+    prompt: "Enable the watch listener? (1/0)"
+    password: false
+  - name: HERMES_WATCH_HOST
+    description: "Address the watch listener binds (default: 0.0.0.0, your LAN)"
+    prompt: "Watch bind address"
+    password: false
+  - name: HERMES_WATCH_WATCH_PORT
+    description: "Port the watch listener binds (default: 8787)"
+    prompt: "Watch port"
+    password: false
+  - name: HERMES_WATCH_ALLOWED_USERS
+    description: "Comma-separated device ids allowed to talk to the agent (default: Hermes pairing codes)"
+    prompt: "Allowed device ids (comma-separated, or empty to use pairing)"
+    password: false
+  - name: HERMES_WATCH_ALLOW_ALL_USERS
+    description: "Allow any device that can reach the port (dev only; bypasses pairing)"
+    prompt: "Allow all devices? (true/false)"
+    password: false
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - agent_loop_stopped
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response

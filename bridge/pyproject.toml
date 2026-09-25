@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-watch"
-version = "0.1.0"
-description = "Bridge Hermes Agent approvals, questions and live token/context stats to a Wear OS watch"
+version = "0.2.0"
+description = "Hermes Agent on a Wear OS watch: approvals, questions and live token/context stats as a gateway platform"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
+    # The adapter is an aiohttp app; Hermes already ships aiohttp, so this is
+    # for the case where the package is installed standalone.
     "aiohttp>=3.9",
+    # Only for reading Hermes' context-length cache; stats.py degrades to a
+    # missing context window if it is absent.
     "PyYAML>=6.0",
 ]
 
@@ -18,9 +22,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.3",
 ]
 
 [project.scripts]
+hermes-watch = "hermes_watch.cli:main"
+# Kept so existing docs, muscle memory and scripts keep working.
 hermes-watch-bridge = "hermes_watch.cli:main"
 
 [tool.setuptools]
@@ -29,3 +36,6 @@ packages = ["hermes_watch"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The adapter binds real loopback ports and the suite is small; a hung test is a
+# bug worth failing on rather than waiting out.
+timeout = 60

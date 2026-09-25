@@ -1,0 +1,563 @@
+"""End-to-end tests for the gateway platform adapter.
+
+These drive a real adapter over real loopback sockets with a real aiohttp
+WebSocket client: the point is to prove the wire behaviour, not to mock it.
+
+They need a Hermes installation to import ``BasePlatformAdapter``, so they skip
+where Hermes is not present (the repo's own CI) and run for real everywhere it
+is. That is a deliberate trade: the adapter is meaningless without Hermes, so a
+green run of these on a machine that has neither tests nothing.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import socket
+import time
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable, Optional
+
+import pytest
+
+pytest.importorskip("gateway.platforms.base", reason="needs a Hermes installation")
+aiohttp = pytest.importorskip("aiohttp")
+
+from aiohttp import WSMsgType  # noqa: E402
+from gateway.config import Platform, PlatformConfig  # noqa: E402
+from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
+
+from hermes_watch import protocol as p  # noqa: E402
+from hermes_watch.live import bus  # noqa: E402
+from hermes_watch.platform import PLATFORM_NAME, HermesWatchAdapter  # noqa: E402
+
+
+# --- harness ----------------------------------------------------------------
+
+
+def free_port() -> int:
+    """A port nobody is using right now.
+
+    Distinct per test so the adapter's machine-global listener lock is per-test
+    too, and so a leaked listener from a failed test cannot make the next one
+    silently pass.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def make_config(port: int, **extra: Any) -> PlatformConfig:
+    settings = {"host": "127.0.0.1", "port": port, "approval_timeout_s": 5.0}
+    settings.update(extra)
+    return PlatformConfig(enabled=True, extra=settings)
+
+
+@pytest.fixture(autouse=True)
+def registered_platform():
+    """``Platform('pixel_watch')`` only resolves for a registered plugin."""
+    entry = PlatformEntry(
+        name=PLATFORM_NAME,
+        label="Pixel Watch",
+        adapter_factory=HermesWatchAdapter,
+        check_fn=lambda: True,
+        plugin_name="hermes-watch",
+    )
+    platform_registry.register(entry)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """Keep the pairing store, runtime status and session store inside the test.
+
+    The store is synthetic (the same DDL the unit tests use), so nothing here
+    reads a real transcript.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    import sqlite3
+
+    from conftest import SESSIONS_DDL, make_session
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(SESSIONS_DDL)
+    make_session(
+        conn, "sess_watch", started_at=time.time() - 120, model="test/model-1",
+        input_tokens=30_000, output_tokens=3_000, cache_read_tokens=60_000,
+        api_call_count=3, title="watch test session", cost=0.01,
+    )
+    conn.close()
+    return tmp_path
+
+
+@asynccontextmanager
+async def rig(home, **extra: Any) -> AsyncIterator[tuple[HermesWatchAdapter, int]]:
+    port = free_port()
+    adapter = HermesWatchAdapter(make_config(port, **extra))
+    assert await adapter.connect() is True, "adapter failed to bind its listener"
+    try:
+        yield adapter, port
+    finally:
+        await adapter.disconnect()
+
+
+@asynccontextmanager
+async def watch(port: int) -> AsyncIterator["aiohttp.ClientWebSocketResponse"]:
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+            yield ws
+
+
+async def read_until(
+    ws: "aiohttp.ClientWebSocketResponse",
+    predicate: Callable[[dict], bool],
+    *,
+    timeout: float = 5.0,
+) -> Optional[dict]:
+    """Next frame matching ``predicate``, or None on timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            message = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        if message.type is not WSMsgType.TEXT:
+            continue
+        frame = json.loads(message.data)
+        if predicate(frame):
+            return frame
+
+
+async def say_hello(ws, device_id: str = "dev-1", label: str = "Pixel Watch") -> dict:
+    await ws.send_str(json.dumps({"v": 1, "type": p.C_HELLO, "device_id": device_id, "label": label}))
+    frame = await read_until(ws, lambda f: f.get("type") == p.S_HELLO)
+    assert frame is not None, "no server hello"
+    return frame
+
+
+def approve_device(home, device_id: str = "dev-1") -> None:
+    """Write the pairing store entry ``hermes pairing approve`` would."""
+    directory = home / "platforms" / "pairing"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{PLATFORM_NAME}-approved.json").write_text(
+        json.dumps({device_id: {"user_name": device_id, "approved_at": time.time()}}),
+        encoding="utf-8",
+    )
+
+
+class Collector:
+    """Stands in for the gateway runner's message handler."""
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def handle(self, event) -> None:
+        self.events.append(event)
+
+
+# --- lifecycle --------------------------------------------------------------
+
+
+async def test_connect_binds_and_healthz_answers():
+    async with rig(None) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/healthz") as response:
+                assert response.status == 200
+                body = await response.json()
+        assert body["ok"] is True
+        assert body["platform"] == PLATFORM_NAME
+        assert body["watches"] == []
+        assert adapter.send_path_degraded is True, "nothing connected yet"
+
+
+async def test_disconnect_releases_the_port():
+    port = free_port()
+    adapter = HermesWatchAdapter(make_config(port))
+    assert await adapter.connect() is True
+    await adapter.disconnect()
+    # Rebinding the same port proves the listener and its socket are really gone:
+    # a leaked socket here is what makes a gateway restart fail with EADDRINUSE.
+    second = HermesWatchAdapter(make_config(port))
+    assert await second.connect() is True
+    await second.disconnect()
+
+
+async def test_bind_conflict_is_fatal_and_not_retried(monkeypatch):
+    held_port = free_port()
+    holder = HermesWatchAdapter(make_config(held_port))
+    assert await holder.connect() is True
+    try:
+        clash = HermesWatchAdapter(make_config(held_port))
+        assert await clash.connect() is False
+        # Retrying forever on a taken port leaks fds and spins the reconnect
+        # watcher, so this must be a non-retryable fatal error.
+        assert clash.has_fatal_error is True
+    finally:
+        await holder.disconnect()
+
+
+# --- authorization ----------------------------------------------------------
+
+
+async def test_unpaired_watch_gets_no_snapshot(isolated_home):
+    async with rig(isolated_home) as (adapter, port):
+        async with watch(port) as ws:
+            hello = await say_hello(ws)
+            assert hello["authorized"] is False
+            assert hello["bridge_version"]
+            # An unpaired device must not see session data at all.
+            assert await read_until(ws, lambda f: f.get("type") == p.S_SNAPSHOT, timeout=1.5) is None
+
+
+async def test_paired_watch_is_authorized_and_gets_a_snapshot(isolated_home):
+    approve_device(isolated_home, "dev-1")
+    async with rig(isolated_home) as (adapter, port):
+        async with watch(port) as ws:
+            hello = await say_hello(ws, device_id="dev-1")
+            assert hello["authorized"] is True
+            snapshot = await read_until(ws, lambda f: f.get("type") == p.S_SNAPSHOT)
+            assert snapshot is not None
+            assert snapshot["live"]["agent_state"] == "idle"
+            assert snapshot["pending"] == []
+            assert adapter.send_path_degraded is False
+
+
+async def test_allow_all_devices_bypasses_pairing(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            hello = await say_hello(ws, device_id="unpaired-device")
+            assert hello["authorized"] is True
+
+
+async def test_unpaired_watch_cannot_resolve_an_approval(isolated_home):
+    """The socket is unauthenticated, so it must not be able to approve anything."""
+    async with rig(isolated_home) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws, device_id="dev-1")
+            pending = adapter._register(
+                kind="approval", payload={"command": "rm -rf /"}, choices=("once", "deny"),
+                timeout=5.0, session_key="sess", future=asyncio.get_running_loop().create_future(),
+            )
+            await ws.send_str(json.dumps({"v": 1, "type": p.C_ANSWER, "id": pending.id, "choice": "once"}))
+            await asyncio.sleep(0.2)
+            assert pending.future is not None and pending.future.done() is False, (
+                "an unpaired socket resolved an approval"
+            )
+            assert await adapter.resolve(pending.id, "once") is True
+
+
+# --- inbound watch messages -------------------------------------------------
+
+
+async def test_watch_text_reaches_handle_message(isolated_home):
+    """A watch message is a normal platform inbound, which is what makes
+    Hermes' own pairing flow able to answer it."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        collector = Collector()
+        adapter.set_message_handler(collector.handle)
+        async with watch(port) as ws:
+            await say_hello(ws, device_id="dev-7", label="Rob's Watch")
+            await ws.send_str(json.dumps({"v": 1, "type": p.C_TEXT, "text": "hello"}))
+            for _ in range(50):
+                if collector.events:
+                    break
+                await asyncio.sleep(0.05)
+        assert collector.events, "watch message never reached the ingress"
+        event = collector.events[0]
+        assert event.text == "hello"
+        assert event.source.chat_id == "dev-7"
+        assert event.source.user_id == "dev-7"
+        assert event.source.chat_type == "dm"
+        assert event.source.platform.value == PLATFORM_NAME
+
+
+async def test_empty_text_frame_is_rejected(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        collector = Collector()
+        adapter.set_message_handler(collector.handle)
+        async with watch(port) as ws:
+            await say_hello(ws)
+            await ws.send_str(json.dumps({"v": 1, "type": p.C_TEXT, "text": "   "}))
+            error = await read_until(ws, lambda f: f.get("type") == p.S_ERROR)
+            assert error is not None
+        assert collector.events == []
+
+
+# --- approvals from another process (a CLI session) -------------------------
+
+
+async def test_out_of_process_approval_round_trip(isolated_home):
+    """The CLI path: a plugin in another process posts a prompt and blocks on
+    the response until the watch answers."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+                await say_hello(ws)
+                ask = asyncio.create_task(
+                    session.post(
+                        f"http://127.0.0.1:{port}/event",
+                        json={
+                            "event": p.E_APPROVAL_REQUESTED,
+                            "payload": {"command": "rm -rf ~/build/cache", "description": "recursive delete"},
+                            "choices": ["once", "deny"],
+                            "timeout": 5.0,
+                            "id": "apv_test",
+                        },
+                    )
+                )
+                frame = await read_until(ws, lambda f: f.get("type") == p.S_EVENT
+                                         and f.get("event") == p.E_APPROVAL_REQUESTED)
+                assert frame is not None, "the watch was never asked"
+                assert frame["id"] == "apv_test"
+                assert frame["payload"]["choices"] == ["once", "deny"]
+                assert frame["payload"]["payload"]["command"] == "rm -rf ~/build/cache"
+                assert adapter._live_frame()["agent_state"] == "waiting_approval"
+
+                await ws.send_str(json.dumps({"v": 1, "type": p.C_ANSWER, "id": "apv_test", "choice": "deny"}))
+                response = await ask
+                assert response.status == 200
+                body = await response.json()
+                assert body == {"ok": True, "choice": "deny", "source": "watch"}
+                resolved = await read_until(ws, lambda f: f.get("event") == p.E_APPROVAL_RESOLVED)
+                assert resolved is not None
+
+
+async def test_approval_off_menu_choice_is_refused(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+                await say_hello(ws)
+                ask = asyncio.create_task(
+                    session.post(
+                        f"http://127.0.0.1:{port}/event",
+                        json={
+                            "event": p.E_APPROVAL_REQUESTED,
+                            "payload": {"command": "x"},
+                            "choices": ["once", "deny"],
+                            "timeout": 0.8,
+                            "id": "apv_off",
+                        },
+                    )
+                )
+                await read_until(ws, lambda f: f.get("event") == p.E_APPROVAL_REQUESTED)
+                # `always` was never offered, so honouring it would widen a
+                # one-shot approval into a permanent one.
+                await ws.send_str(json.dumps({"v": 1, "type": p.C_ANSWER, "id": "apv_off", "choice": "always"}))
+                response = await ask
+                body = await response.json()
+        assert body["choice"] is None, "an off-menu choice was accepted"
+
+
+async def test_unanswered_approval_times_out_failing_closed(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+                await say_hello(ws)
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={
+                        "event": p.E_APPROVAL_REQUESTED,
+                        "payload": {"command": "x"},
+                        "choices": ["once", "deny"],
+                        "timeout": 0.5,
+                        "id": "apv_slow",
+                    },
+                ) as response:
+                    assert response.status == 200
+                    body = await response.json()
+        assert body == {"ok": True, "choice": None, "source": "timeout"}
+        assert adapter._pending == {}, "a timed-out prompt was left pending"
+
+
+async def test_approval_with_no_watch_connected_is_refused(isolated_home):
+    """No watch means fail closed: the caller must fall back to its own prompt
+    rather than block on a wrist that is not there."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}/event",
+                json={
+                    "event": p.E_APPROVAL_REQUESTED,
+                    "payload": {"command": "x"},
+                    "choices": ["once", "deny"],
+                    "timeout": 2.0,
+                },
+            ) as response:
+                assert response.status == 503
+        assert adapter._pending == {}
+
+
+async def test_answer_elsewhere_is_carried_back_to_the_blocked_caller(isolated_home):
+    """An approval answered in the terminal must reach the parked caller with
+    the choice the human actually made, not as a timeout."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+                await say_hello(ws)
+                ask = asyncio.create_task(
+                    session.post(
+                        f"http://127.0.0.1:{port}/event",
+                        json={
+                            "event": p.E_APPROVAL_REQUESTED,
+                            "payload": {"command": "x"},
+                            "choices": ["once", "deny"],
+                            "timeout": 5.0,
+                            "id": "apv_else",
+                        },
+                    )
+                )
+                await read_until(ws, lambda f: f.get("event") == p.E_APPROVAL_REQUESTED)
+                await session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_APPROVAL_RESOLVED, "payload": {"id": "apv_else", "choice": "deny"}},
+                )
+                response = await ask
+                body = await response.json()
+        assert body == {"ok": True, "choice": "deny", "source": "watch"}
+
+
+# --- approvals raised inside the gateway ------------------------------------
+
+
+async def test_native_approval_prompt_uses_hermes_choice_set(isolated_home, monkeypatch):
+    """An approval Hermes raised itself renders with the base class' labels and
+    resolves through ``resolve_gateway_approval``."""
+    resolved: list[tuple] = []
+
+    def fake_resolve(session_key: str, choice: str, request_id: Optional[str] = None) -> int:
+        resolved.append((session_key, choice, request_id))
+        return 1
+
+    monkeypatch.setattr("hermes_watch.platform._resolve_gateway_approval", fake_resolve)
+
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        from gateway.platforms.base import ExecApprovalPrompt
+
+        prompt = ExecApprovalPrompt(
+            chat_id="dev-1",
+            session_key="agent:main:cli",
+            text="Approval needed: run `rm -rf ~/cache`?",
+            actions=adapter._exec_approval_actions(allow_permanent=True, allow_session=True, smart_denied=False),
+            command="rm -rf ~/cache",
+            description="recursive delete",
+            smart_denied=False,
+            metadata={"request_id": "req-42"},
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{port}/watch") as ws:
+                await say_hello(ws)
+                # Through the base class' own entry point, metadata included:
+                # that is how Hermes passes the request id a late answer must
+                # be matched against.
+                result = await adapter.send_exec_approval(
+                    "dev-1", prompt.command, prompt.session_key,
+                    description=prompt.description, metadata=prompt.metadata,
+                )
+                assert result.success is True
+                frame = await read_until(ws, lambda f: f.get("event") == p.E_APPROVAL_REQUESTED)
+                assert frame is not None
+                choices = frame["payload"]["choices"]
+                assert choices == ["once", "session", "always", "deny"]
+                await ws.send_str(json.dumps({"v": 1, "type": p.C_ANSWER, "id": frame["id"], "choice": "session"}))
+                for _ in range(50):
+                    if resolved:
+                        break
+                    await asyncio.sleep(0.05)
+        assert resolved == [("agent:main:cli", "session", "req-42")]
+
+
+async def test_question_prompt_carries_choices_and_can_be_retired(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            result = await adapter.send_clarify(
+                chat_id="dev-1", question="Deploy to which region?", choices=["us-east", "eu-west"],
+                clarify_id="clr_1", session_key="agent:main:cli",
+            )
+            assert result.success is True
+            frame = await read_until(ws, lambda f: f.get("event") == p.E_QUESTION_PENDING)
+            assert frame is not None
+            assert frame["payload"]["choices"] == ["us-east", "eu-west"]
+            assert adapter._live_frame()["agent_state"] == "waiting_input"
+            await adapter.retire_clarify_card("clr_1", notice="answered in terminal")
+            retired = await read_until(ws, lambda f: f.get("event") == p.E_QUESTION_RESOLVED)
+            assert retired is not None
+            assert adapter._pending == {}
+
+
+# --- stats and state --------------------------------------------------------
+
+
+async def test_observations_drive_agent_state_and_are_pushed(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            bus.observe(p.E_TOOL_STARTED, {"tool_name": "terminal"})
+            assert adapter._live_frame()["agent_state"] == "tool"
+            assert adapter._live_frame()["last_tool"] == "terminal"
+            stats = await read_until(ws, lambda f: f.get("type") == p.S_STATS)
+            assert stats is not None
+            assert stats["live"]["agent_state"] == "tool"
+            bus.observe(p.E_TURN_ENDED, {})
+            assert adapter._live_frame()["agent_state"] == "idle"
+
+
+async def test_api_measurements_reach_the_stats_payload(isolated_home):
+    """Live tok/s must come from a measured call, not from a guess."""
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            bus.observe("api_request", {"output_tokens": 400, "api_duration": 2.0, "prompt_tokens": 12_000})
+            await asyncio.sleep(0.05)
+            snapshot = await asyncio.to_thread(adapter._build_stats)
+        session = snapshot["session"]
+        observation = adapter._observation()
+        assert observation.output_tokens == 400
+        assert observation.api_duration == 2.0
+        # 400 tokens in a 2.0 s provider call is 200 tok/s. The number comes
+        # from the measurement, not from wall-clock session time.
+        assert session is not None
+        assert session["tok_per_s"]["live"] == 200.0
+        assert session["tok_per_s"]["live_source"] == "api_call"
+        # Context usage prefers the exact prompt size over any estimate.
+        assert snapshot["context"]["used_tokens"] == 12_000
+        assert snapshot["context"]["source"] == "live"
+
+
+async def test_send_reports_failure_with_no_watch(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        result = await adapter.send("dev-1", "hello")
+        assert result.success is False
+        assert result.retryable is True
+
+
+async def test_send_delivers_to_a_connected_watch(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            result = await adapter.send("dev-1", "pairing code: ABCD1234")
+            assert result.success is True
+            frame = await read_until(ws, lambda f: f.get("event") == "message")
+            assert frame is not None
+            assert frame["payload"]["text"] == "pairing code: ABCD1234"
+
+
+async def test_ingest_token_is_enforced_when_configured(isolated_home):
+    async with rig(isolated_home, allow_all_devices=True, ingest_token="s3cret") as (adapter, port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}/event",
+                json={"event": p.E_TURN_STARTED, "payload": {}, "token": "wrong"},
+            ) as response:
+                assert response.status == 403
+            async with session.post(
+                f"http://127.0.0.1:{port}/event",
+                json={"event": p.E_TURN_STARTED, "payload": {}, "token": "s3cret"},
+            ) as response:
+                assert response.status == 200

@@ -27,81 +27,91 @@ Approvals are two-way. Questions are notify-only in v1 (see
 
 | Feature | Status |
 |---|---|
-| Push notification when Hermes blocks on a tool approval | **working** (bridge + protocol + tests; app code ready) |
-| Approve / deny / allow-for-session from the watch notification | **working** (same) |
+| Push notification when Hermes blocks on a tool approval | **working** (adapter + plugin + 87 tests; app code in CI) |
+| Approve / deny / allow-for-session from the watch notification | **working** |
+| Same approvals from a **CLI** session, not just the gateway | **working** (in-process approval transport) |
 | Live notification when the agent is waiting on a question | **working**, notify-only |
 | Tokens/sec, context remaining, session tokens, 30-day totals | **working** |
 | Watch tile + stats screen | app code written, not yet built on a device |
 | Complication | not started |
 
-Honest status: the **bridge is finished and verified** — 46 tests including a
-live approval round-trip over real sockets, plus a run against a real Hermes
-session store. The **Wear OS app is written but has never been compiled or run**
-(this repo was created on a machine with no Android SDK; CI compiles it). See
-[ROADMAP.md](ROADMAP.md).
+Honest status: the **Python half is finished and verified** — 87 tests, including
+real-socket round trips for both approval paths and a contract suite that pins
+the app's own frames. The **Wear OS app is written but has never been compiled or
+run by hand** (this repo was created on a machine with no Android SDK; CI
+compiles it). See [ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
+The watch is a **Hermes gateway platform**, not a sidecar. That means Hermes'
+own gateway owns the socket, the pairing, the delivery ledger and the approvals,
+and there is no second daemon to run, supervise or secure.
+
 ```
-   Hermes process                     hermes-watch-bridge                Pixel Watch
- ┌───────────────────┐               ┌──────────────────────┐         ┌──────────────┐
- │ plugin hooks      │  POST events  │  ingest 127.0.0.1:8788│         │              │
- │  pre_api_request  ├──────────────►│                      │         │              │
- │  post_tool_call   │               │        Hub           │  WS     │  foreground  │
- │  agent_loop_stop  │               │  · agent state       ├────────►│  service     │
- │                   │               │  · pending approvals │  :8787  │      │       │
- │ approval          │               │  · stats snapshots   │         │      ▼       │
- │  transport  ◄─────┼───long-poll───┤                      │◄────────┤  notifications│
- │  present(request) │   the decision│                      │ answer  │  + tile + UI │
- └─────────┬─────────┘               └──────────┬───────────┘         └──────────────┘
-           │                                    │ read-only
-           │ reads live usage/latency           │
-           │                                    ▼
-           │                          ~/.hermes/state.db
-           │                          (sessions: tokens, cost, api_calls)
-           ▼
-     agent.model_metadata
-     get_model_context_length()   ← the real context window
+   Hermes gateway process                                   Pixel Watch
+ ┌──────────────────────────────────────────────┐        ┌──────────────┐
+ │  plugin hooks    ─► in-process bus (live.py)  │        │              │
+ │   pre_api_request, post_api_request, ...      │        │  foreground  │
+ │                                               │        │  service     │
+ │  gateway runner ─► runs the platform adapter: │  WS    │      │       │
+ │   · WS listener  :8787  /v1/watch   ◄─────────┼────────┤      ▼       │
+ │   · pending approvals + questions             │        │  notifications
+ │   · pairing via PairingStore                  │        │  + tile + UI │
+ │   · stats snapshots ──────────────────────────┼────────┤              │
+ │                                               │        └──────────────┘
+ │  approval transport ◄── HTTP 127.0.0.1:8787 ──┼── a CLI session's
+ │                       (only when the gateway │   approval, routed
+ │                        isn't the one asking) │   through the plugin
+ └───────────────────────┬───────────────────────┘
+                         │ read-only
+                         ▼
+                   ~/.hermes/state.db
+                   (sessions: tokens, cost, api_calls)
 ```
 
-Three components, and the split matters:
+Three pieces, each with one job:
 
-* **The plugin** runs *inside* a live Hermes process. It subscribes to lifecycle
-  hooks (`pre_api_request`, `post_api_request`, `post_tool_call`,
-  `agent_loop_stopped`, …) and registers an **approval transport**, which is
-  Hermes' supported way to change *where* a human sees and answers an approval.
-  It never blocks the agent: every hook hands work to a bounded background queue.
-* **The bridge daemon** is a separate process because the state must outlive any
-  one Hermes process, and because a watch socket has no business living in the
-  agent's event loop. It owns watch connections, pending requests, and stats.
-* **The watch app** is a thin client: one WebSocket, notifications, a tile, and
-  a stats screen. No logic the bridge could do instead.
+* **`platform.py` — the adapter.** A `BasePlatformAdapter` subclass the gateway
+  builds and runs: it hosts the WebSocket listener, validates frames, holds
+  pending approvals/questions, asks `PairingStore` whether a device is approved,
+  and routes watch messages back through `handle_message` so they land in normal
+  Hermes sessions. It never decides authorization itself — Hermes' runner does
+  that centrally, which is why no shared secret exists anywhere in this repo.
+* **`plugin.py` — the hooks and the CLI approval transport.** It runs *inside* a
+  live Hermes process and streams lifecycle events into the adapter's in-process
+  bus when the gateway is right there, or over HTTP when it isn't. It also
+  registers the approval transport, which is Hermes' supported way to change
+  *where* a human answers. That transport is what makes a **CLI** approval
+  reachable from your wrist; the gateway can't do that by itself.
+* **The watch app** is a thin client: one WebSocket, notifications, a tile, a
+  stats screen. No logic the adapter could do instead — and its wire protocol is
+  frozen (see [docs/protocol.md](docs/protocol.md)), because it ships separately.
 
 ## Quickstart
 
-**1. Install the bridge** (Python 3.10+, needs `aiohttp` and `PyYAML`):
-
-```bash
-pip install ./bridge          # provides the `hermes-watch-bridge` command
-hermes-watch-bridge serve
-```
-
-The first run prints the LAN address to pair with and creates a pairing token at
-`$HERMES_HOME/hermes-watch/token` (mode 0600). Leave it running.
-
-**2. Install the Hermes plugin** so Hermes starts feeding the bridge:
+**1. Install the plugin** (no Python install step needed — the repo root is the
+plugin and adds `bridge/` to `sys.path` itself):
 
 ```bash
 hermes plugins install RobSpectre/hermes-watch --enable
 ```
 
-Then set the approval transport and the fallback, in `~/.hermes/config.yaml`:
+**2. Enable the platform** in `~/.hermes/config.yaml`, and pick the approval
+transport for CLI sessions:
 
 ```yaml
+gateway:
+  platforms:
+    pixel_watch:
+      enabled: true
+      extra:
+        host: 0.0.0.0        # 127.0.0.1 keeps it on this machine only
+        port: 8787
+
 security:
   approval:
     transport: pixel-watch
-    transport_fallback: builtin   # show the normal prompt when no watch is connected
+    transport_fallback: builtin   # the normal prompt when no watch is connected
 ```
 
 `transport_fallback: builtin` is the important line: without it, a failed
@@ -109,15 +119,33 @@ transport denies by default, and an approval you never saw would be silently
 refused. With it, Hermes falls back to the terminal prompt whenever your watch
 isn't connected.
 
-**3. Check it works without a watch** — this is also how you develop the app:
+**3. Start the gateway** — the listener starts with it:
 
 ```bash
-hermes-watch-bridge stats                 # the same numbers the watch shows
-python bridge/tools/fake_watch.py --answer once
+hermes gateway run          # or the installed service
 ```
 
-**4. Pair the watch.** Open the app, enter `host:port` and the pairing token.
-(Wear OS app build instructions: [docs/setup.md](docs/setup.md).)
+**4. Pair the watch.** Connect the app to `host:port` (the token field is a
+leftover from the pre-gateway design: leave it blank), send any message, and
+Hermes answers with an 8-character pairing code. Approve it on the host:
+
+```bash
+hermes pairing list
+hermes pairing approve pixel_watch <code>
+```
+
+That is the whole authorization story: no token file, nothing to rotate, and
+`hermes pairing revoke pixel_watch <device>` to undo it. (Wear OS app build
+instructions: [docs/setup.md](docs/setup.md).)
+
+**5. Check it without a watch** — this is also how you develop the app:
+
+```bash
+pip install ./bridge            # optional: only for the standalone CLI
+hermes-watch stats              # the same numbers the watch shows
+hermes-watch doctor             # listener up? plugin installed? devices paired?
+python bridge/tools/fake_watch.py --pair --answer once
+```
 
 ## What the numbers mean
 
@@ -140,43 +168,52 @@ be summed — the per-call average is the best available proxy and says so.
 ## Repository layout
 
 ```
+__init__.py                   the Hermes plugin entry point (shim → bridge/)
+plugin.yaml                   plugin manifest (kind: platform)
 bridge/                       the Python half — complete, tested
   hermes_watch/
     protocol.py               the wire contract, in code
+    platform.py               the gateway platform adapter + WS listener
+    plugin.py                 hooks, in-process bus, approval transport
+    live.py                   the bus shared by the plugin and the adapter
     stats.py                  state.db queries + live measurements
-    hub.py                    connections, pending approvals, agent state
-    daemon.py                 aiohttp HTTP + WebSocket listeners
-    plugin.py                 the Hermes plugin (hooks + approval transport)
-    client.py                 stdlib client the plugin uses
-    cli.py                    hermes-watch-bridge serve|stats|token|doctor
-  tests/                      46 tests, incl. approval round-trip over sockets
+    settings.py               address/timeout config, no secrets
+    client.py                 stdlib HTTP client the plugin uses
+    cli.py                    hermes-watch stats|doctor|sessions
+  tests/                      87 tests, incl. two real-socket approval paths
+                                and a frozen contract suite for the app
   tools/fake_watch.py         terminal stand-in for the watch
-watch/                        the Wear OS half — written, not yet built
+watch/                        the Wear OS half — written, built by CI
   app/src/main/java/...       Compose for Wear UI, foreground service, tile
 docs/
-  protocol.md                 normative WebSocket contract
+  protocol.md                 normative WebSocket contract (frozen)
   hermes-integration.md       which Hermes APIs this uses, and which it can't
   setup.md                    build, install, pair, troubleshoot
 ```
 
 ## Security
 
-The pairing token is the only thing between your LAN and the ability to approve
-tool calls on your machine, so treat the watch port as a trust boundary:
+Design choices, not promises:
 
-* The plugin ingest port binds to `127.0.0.1` and is never exposed. The WebSocket
-  endpoint is deliberately *not* served on the loopback listener.
-* Token comparisons are constant-time; the token file is created `0600` before
-  anything is written to it.
-* Every unanswered request **fails closed**: a timeout, a disconnect, or an
-  unparseable frame becomes a *denial*, never an allow.
-* A watch cannot return a scope Hermes did not offer (`always` on a once-only
-  request is rejected by the host).
-* Tool arguments and transcript content are never forwarded — tool *names*,
+* **No shared secret.** Authorization is Hermes' `PairingStore`: a device the
+  owner approved on the host, and nothing else. There is no token file in this
+  repository's code path to leak, rotate or forget.
+* **Pairing is keyed on the watch's self-declared label.** The app sends no
+  device id (its protocol is frozen and it has nowhere to keep one), so a rogue
+  LAN client claiming an approved label would be treated as that device. Treat
+  the watch port as a LAN trust boundary: bind it to a private interface, or pin
+  `HERMES_WATCH_ALLOWED_USERS` to the exact labels you own.
+* **Unauthenticated sockets get no data.** A watch that isn't paired receives a
+  hello and a pairing code, never a snapshot, and its answers are refused.
+* **Every unanswered request fails closed**: a timeout, a disconnect, or an
+  unparseable frame becomes a *denial* or falls back to the terminal prompt,
+  never an allow.
+* **A watch cannot return a scope Hermes did not offer** (`always` on a
+  once-only request is rejected, both by the adapter and by Hermes).
+* **Tool arguments and transcript content are never forwarded** — tool *names*,
   counts, ids, and the already-redacted approval command only.
-* `pre_approval_request` payloads can contain secrets in the command text; the
-  bridge clips and forwards the command because that is exactly what the human
-  needs to see to decide. Point it at networks and hosts you control.
+* **The plugin never raises into the agent.** Hooks queue and drop on overflow;
+  a watch fault is never an agent fault.
 
 ## Roadmap
 

@@ -1,21 +1,23 @@
-"""Bridge settings and pairing token, stored under the Hermes home.
+"""Local settings for the watch platform.
 
-Layout (``$HERMES_HOME/hermes-watch/``)::
+There is no shared secret here on purpose. Access to the watch socket is
+granted by Hermes' own pairing store: a device connects with a stable id, sends
+one message, and the gateway's standard unauthorized-DM path answers with a
+pairing code the owner approves on the host with ``hermes pairing approve
+pixel_watch <code>``. That is strictly better than a token pasted onto a watch
+keyboard, and it means there is no credential file in this package to leak,
+rotate, or forget.
 
-    config.json   non-secret settings (ports, bind addresses, label)
-    token         the shared secret, mode 0600
-
-The token is deliberately *not* in ``config.json`` and not in ``.env``: it is
-generated on first use, never printed by default, and is the only thing
-standing between your LAN and the ability to approve tool calls on your
-machine. Rotate it with ``hermes-watch-bridge rotate-token``.
+What is left is a small amount of non-secret configuration: which address the
+listener binds and how long a prompt waits. It exists as a file only so the CLI
+(``hermes-watch stats``) and the gateway agree on defaults when the gateway
+config is not the thing being edited.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -23,22 +25,25 @@ from typing import Any, Optional
 from .stats import hermes_home
 
 DIR_NAME = "hermes-watch"
-TOKEN_BYTES = 32
+
+#: ``config.yaml`` key (``gateway.platforms.pixel_watch``) and the string the
+#: pairing store keys on. Defined here because both the plugin entry point and
+#: the adapter need it, and this module must stay importable without pulling in
+#: the gateway's platform machinery.
+PLATFORM_NAME = "pixel_watch"
+PLATFORM_LABEL = "Pixel Watch"
+DEFAULT_WATCH_PORT = 8787
 
 
 @dataclass
 class BridgeConfig:
-    """Everything the daemon and the plugin need to find each other."""
+    """Non-secret settings shared by the adapter and the CLI."""
 
     watch_host: str = "0.0.0.0"
-    watch_port: int = 8787
-    ingest_host: str = "127.0.0.1"
-    ingest_port: int = 8788
+    watch_port: int = DEFAULT_WATCH_PORT
     label: str = "pixel-watch"
-    #: Seconds an unanswered watch approval waits before failing closed.
+    #: Seconds an unanswered watch prompt waits before failing closed.
     approval_timeout_s: float = 300.0
-    #: Notify the watch when the agent is waiting on a question it cannot answer.
-    notify_questions: bool = True
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -54,12 +59,53 @@ def config_path(home: Optional[Path] = None) -> Path:
     return config_dir(home) / "config.json"
 
 
-def token_path(home: Optional[Path] = None) -> Path:
-    return config_dir(home) / "token"
+def _gateway_extra(home: Optional[Path] = None) -> dict[str, Any]:
+    """The ``extra`` block for this platform out of Hermes' own config.
+
+    Read defensively and without importing the gateway: this module is imported
+    by the CLI and by the plugin, neither of which should fail because a config
+    file is malformed or a YAML parser is missing. Returning ``{}`` just means
+    the defaults below apply.
+
+    It matters because the adapter binds whatever ``extra`` says: the plugin's
+    approval transport and the CLI's doctor both have to agree with it, or a CLI
+    approval would be posted to a port nothing listens on.
+    """
+    path = (home or hermes_home()) / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    data: Any = None
+    try:
+        from ruamel.yaml import YAML  # Hermes' own parser, when available
+
+        data = YAML(typ="safe").load(raw)
+    except Exception:
+        try:
+            import yaml
+
+            data = yaml.safe_load(raw)
+        except Exception:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    gateway = data.get("gateway")
+    platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    entry = platforms.get(PLATFORM_NAME) if isinstance(platforms, dict) else None
+    extra = entry.get("extra") if isinstance(entry, dict) else None
+    return extra if isinstance(extra, dict) else {}
 
 
 def load_config(home: Optional[Path] = None) -> BridgeConfig:
-    """Load config, creating the directory. Environment overrides win."""
+    """Load config, tolerating its absence. Environment overrides win.
+
+    Precedence, lowest first: dataclass defaults, the legacy ``config.json``,
+    the gateway's ``config.yaml`` (what the adapter actually binds), then the
+    ``HERMES_WATCH_*`` environment.
+    """
     path = config_path(home)
     data: dict[str, Any] = {}
     if path.exists():
@@ -67,14 +113,31 @@ def load_config(home: Optional[Path] = None) -> BridgeConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-    known = {f for f in BridgeConfig().__dataclass_fields__}
+    known = set(BridgeConfig().__dataclass_fields__)
     config = BridgeConfig(**{k: v for k, v in data.items() if k in known})
-    if os.environ.get("HERMES_WATCH_WATCH_PORT"):
-        config.watch_port = int(os.environ["HERMES_WATCH_WATCH_PORT"])
-    if os.environ.get("HERMES_WATCH_INGEST_PORT"):
-        config.ingest_port = int(os.environ["HERMES_WATCH_INGEST_PORT"])
-    if os.environ.get("HERMES_WATCH_LABEL"):
-        config.label = os.environ["HERMES_WATCH_LABEL"]
+    extra = _gateway_extra(home)
+    for key, attr, cast in (
+        ("host", "watch_host", str),
+        ("port", "watch_port", int),
+        ("approval_timeout_s", "approval_timeout_s", float),
+    ):
+        if key in extra:
+            try:
+                setattr(config, attr, cast(extra[key]))
+            except (TypeError, ValueError):
+                pass
+    for env, attr, cast in (
+        ("HERMES_WATCH_HOST", "watch_host", str),
+        ("HERMES_WATCH_WATCH_PORT", "watch_port", int),
+        ("HERMES_WATCH_LABEL", "label", str),
+        ("HERMES_WATCH_APPROVAL_TIMEOUT_S", "approval_timeout_s", float),
+    ):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                setattr(config, attr, cast(raw))
+            except ValueError:
+                pass
     return config
 
 
@@ -85,34 +148,11 @@ def save_config(config: BridgeConfig, home: Optional[Path] = None) -> Path:
     return path
 
 
-def load_token(home: Optional[Path] = None) -> Optional[str]:
-    env = os.environ.get("HERMES_WATCH_TOKEN")
-    if env:
-        return env.strip()
-    path = token_path(home)
-    if path.exists():
-        value = path.read_text(encoding="utf-8").strip()
-        return value or None
-    return None
-
-
-def ensure_token(home: Optional[Path] = None, *, rotate: bool = False) -> str:
-    """Return the pairing token, creating (or replacing) it as needed."""
-    path = token_path(home)
-    if path.exists() and not rotate:
-        existing = path.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing
-    path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(TOKEN_BYTES)
-    # Create with 0600 before writing so the secret is never briefly world-readable.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(token + "\n")
-    os.chmod(path, 0o600)
-    return token
-
-
-def ingest_url(home: Optional[Path] = None) -> str:
+def watch_url(home: Optional[Path] = None) -> str:
+    """Base URL of the running watch listener, for the CLI and the plugin."""
     config = load_config(home)
-    return os.environ.get("HERMES_WATCH_URL") or f"http://{config.ingest_host}:{config.ingest_port}"
+    env = os.environ.get("HERMES_WATCH_URL")
+    if env:
+        return env.rstrip("/")
+    host = "127.0.0.1" if config.watch_host in ("0.0.0.0", "::") else config.watch_host
+    return f"http://{host}:{config.watch_port}"

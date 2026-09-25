@@ -8,11 +8,13 @@ is what it is.
 
 The Python half is finished and verified:
 
-* Wire protocol v1 with additive-versioning rules (`docs/protocol.md`).
+* Wire protocol v1 with additive-versioning rules (`docs/protocol.md`), pinned by
+  a contract suite that speaks the watch app's own frames.
 * Stats from `state.db` plus exact per-call measurements from Hermes hooks.
-* Approval transport over the watch socket, fail-closed on every failure path.
-* 46 tests, including an approval round-trip over real sockets and a
-  long-poll/token/scope-escalation matrix.
+* 87 tests, including two approval round-trips over real sockets (the gateway's
+  own prompt, and a CLI session's through the plugin transport), a
+  scope-escalation matrix, and adapter lifecycle cases (port in use, idempotent
+  disconnect, unpaired sockets refused).
 
 Deliberately not in scope: any UI. Nothing on the watch side was needed to prove
 the contract works, and the contract is the risky part — the ordering of
@@ -35,8 +37,11 @@ device can confirm:
 3. **Battery.** Unmeasured. See `docs/setup.md` for the current behaviour and the
    planned lever (slower ticker when idle, snapshot on screen-wake).
 4. **Wake latency.** How long between "you tap Allow" and the agent continuing?
-   Should be under a second on a good network; the long-poll design means it is
-   one round trip.
+   Should be under a second on a good network; the round trip is one WebSocket
+   frame plus one approval resolution.
+5. **Pairing UX.** The app still shows a token field that no longer does
+   anything. Decide whether to keep it (a frozen protocol means the field stays
+   until a client-side release) or ship a v2 that drops it.
 
 ## v0.3 — answering questions
 

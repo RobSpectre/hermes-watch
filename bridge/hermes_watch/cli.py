@@ -1,13 +1,18 @@
-"""``hermes-watch-bridge`` -- run the daemon, inspect stats, manage pairing.
+"""``hermes-watch`` -- inspect what the watch sees, and check the setup.
 
-Deliberately a plain argparse CLI with plain-text output, because most of its
-output ends up pasted into an issue or read over SSH.
+The listener is not run from here any more: it is a Hermes gateway platform, so
+``hermes gateway run`` (or the installed service) hosts it. What is left is the
+tooling a human needs when something looks wrong -- the same stats document the
+watch renders, the session list, the listener's health, and a one-pass check of
+the things that actually break.
+
+Plain argparse and plain text output, because most of this ends up pasted into
+an issue or read over SSH.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import socket
@@ -16,15 +21,13 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
+from .client import AdapterClient
 from .settings import (
+    PLATFORM_NAME,
     config_path,
-    ensure_token,
     hermes_home,
-    ingest_url,
     load_config,
-    load_token,
-    save_config,
-    token_path,
+    watch_url,
 )
 from .stats import StatsEngine, find_recent_sessions, state_db_path
 
@@ -75,6 +78,27 @@ def _local_addresses() -> list[str]:
     return addresses
 
 
+def _pairing_dir() -> Path:
+    """Where Hermes keeps pairing state. Mirrors ``gateway.pairing`` without
+    importing the gateway into a CLI process."""
+    override = os.environ.get("HERMES_PAIRING_DIR")
+    if override:
+        return Path(override)
+    home = hermes_home()
+    candidate = home / "platforms" / "pairing"
+    legacy = home / "pairing"
+    return candidate if candidate.exists() or not legacy.exists() else legacy
+
+
+def _approved_devices() -> list[str]:
+    path = _pairing_dir() / f"{PLATFORM_NAME}-approved.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return sorted(str(key) for key in data)
+    except Exception:
+        return []
+
+
 # --- commands ---------------------------------------------------------------
 
 
@@ -110,11 +134,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
         if live is not None:
             live_text = f"{live} (measured over provider call latency)"
         else:
-            live_text = "— (no live measurement yet: is the plugin installed?)"
-        if average is not None:
-            average_text = f"{average} (wall clock, {rate['session_avg_source']})"
-        else:
-            average_text = "—"
+            live_text = "— (no live measurement: nothing has reported one yet)"
+        average_text = f"{average} (wall clock, {rate['session_avg_source']})" if average is not None else "—"
         print(f"tok/s         {live_text}")
         print(f"              session avg {average_text}")
     print()
@@ -156,78 +177,87 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_token(args: argparse.Namespace) -> int:
-    token = ensure_token(rotate=args.rotate)
-    if args.rotate:
-        print("pairing token rotated — re-pair every watch")
-    if args.show:
-        print(token)
-    else:
-        print(f"pairing token: {token[:4]}...{token[-4:]}  ({len(token)} chars, {token_path()})")
-        print("pass --show to print it in full")
+def cmd_status(args: argparse.Namespace) -> int:
+    """Ask the running listener what it is doing."""
+    url = args.url or watch_url()
+    health = AdapterClient(url).health()
+    if health is None:
+        print(f"no watch listener at {url}")
+        print("the listener lives in the gateway now:")
+        print("  hermes gateway run          # foreground")
+        print("  hermes gateway status       # is the service up?")
+        return 1
+    watches = health.get("watches") or []
+    print(f"listener      {url}")
+    print(f"platform      {PLATFORM_NAME} {health.get('version', '?')}  up {health.get('uptime_s', '?')}s")
+    print(f"agent state   {health.get('state', '?')}")
+    print(f"watches       {len(watches)} connected")
+    for watch in watches:
+        print(
+            f"  {watch.get('device_id', '?')[:28]:28}  {watch.get('label') or '-':16}"
+            f"  authorized={watch.get('authorized')}  {watch.get('connected_s', '?')}s"
+        )
+    pending = health.get("pending") or []
+    if pending:
+        print(f"pending       {len(pending)}")
+        for item in pending:
+            print(f"  {item.get('id', '?')}  {item.get('kind', '?'):8}  {item.get('remaining_s', '?')}s left")
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    from .client import BridgeClient
-
-    client = BridgeClient(args.url or ingest_url(), token=load_token() or "")
-    health = client.health()
-    if health is None:
-        print(f"bridge not reachable at {args.url or ingest_url()}")
-        return 1
-    print(json.dumps(health, indent=2))
+def cmd_pairing(args: argparse.Namespace) -> int:
+    """Show pairing state without needing the gateway up."""
+    approved = _approved_devices()
+    directory = _pairing_dir()
+    pending_path = directory / f"{PLATFORM_NAME}-pending.json"
+    print(f"pairing store   {directory}")
+    print(f"approved        {len(approved)} device(s)")
+    for device in approved:
+        print(f"  {device}")
+    if pending_path.exists():
+        try:
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        except Exception:
+            pending = {}
+        if pending:
+            print(f"waiting         {len(pending)} request(s) -- approve on the host:")
+            print(f"  hermes pairing list")
+            print(f"  hermes pairing approve {PLATFORM_NAME} <code>")
+    else:
+        print("waiting         none")
+    if not approved:
+        print()
+        print("A watch pairs by itself: connect the app, and it sends one message.")
+        print("Hermes answers with an 8-character code, shown on the watch. Approve it")
+        print(f"with: hermes pairing approve {PLATFORM_NAME} <code>")
     return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    import logging
-
-    from .daemon import serve
-    from .hub import Hub
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
+    """The standalone daemon is gone; point at what replaced it."""
     config = load_config()
-    if args.watch_port:
-        config.watch_port = args.watch_port
-    if args.ingest_port:
-        config.ingest_port = args.ingest_port
-    if args.host:
-        config.watch_host = args.host
-    save_config(config)
-    token = ensure_token()
-
-    hub = Hub(StatsEngine(db_path=Path(args.db) if args.db else None))
-    hub.bridge_version = __version__
-    hub.profile = os.environ.get("HERMES_PROFILE") or "default"
-
     addresses = _local_addresses() or ["<this-host>"]
-    print(f"hermes-watch bridge {__version__}")
-    print(f"  watch socket   ws://{addresses[0]}:{config.watch_port}/v1/watch?token=<pairing-token>")
+    print("This command is gone: the watch listener is a Hermes gateway platform now,")
+    print("so there is no second process to run.")
+    print()
+    print("    1. enable it in ~/.hermes/config.yaml:")
+    print()
+    print("         gateway:")
+    print("           platforms:")
+    print(f"             {PLATFORM_NAME}:")
+    print("               enabled: true")
+    print()
+    print("    2. start the gateway (or the installed service):")
+    print()
+    print("         hermes gateway run        # foreground")
+    print("         hermes gateway install    # as a service")
+    print()
+    print(f"The watch connects to  ws://{addresses[0]}:{config.watch_port}/watch")
     for extra in addresses[1:]:
-        print(f"                 ws://{extra}:{config.watch_port}/v1/watch?token=<pairing-token>")
-    print(f"  plugin ingest  {ingest_url()}")
-    print(f"  pairing token  {token[:4]}...{token[-4:]}   (hermes-watch-bridge token --show)")
-    print(f"  session store  {state_db_path()}")
-    print("  ctrl-c to stop")
-    try:
-        asyncio.run(
-            serve(
-                hub,
-                watch_host=config.watch_host,
-                watch_port=config.watch_port,
-                ingest_host=config.ingest_host,
-                ingest_port=config.ingest_port,
-                ingest_token=token,
-                watch_token=token,
-            )
-        )
-    except KeyboardInterrupt:
-        print("\nstopped")
-    return 0
+        print(f"                      ws://{extra}:{config.watch_port}/watch")
+    print("Pairing is by code, not by token: connect, then approve the code the watch shows")
+    print(f"with  hermes pairing approve {PLATFORM_NAME} <code>")
+    return 2
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -244,21 +274,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"plugin installed   {plugin_dir}  {'yes' if plugin_dir.exists() else 'no'}")
     if not plugin_dir.exists():
         print("                   install with: hermes plugins install RobSpectre/hermes-watch --enable")
+        problems += 1
 
     config = load_config()
     print(f"config             {config_path()}  ({config.watch_host}:{config.watch_port})")
-    print(f"pairing token      {'present' if load_token() else 'MISSING'}")
+    approved = _approved_devices()
+    print(f"paired devices     {len(approved)}" + (f"  ({', '.join(approved)})" if approved else ""))
+    if not approved:
+        print(f"                   pair a watch, then: hermes pairing approve {PLATFORM_NAME} <code>")
 
-    for name, host, port in (("watch port", config.watch_host, config.watch_port),
-                             ("ingest port", config.ingest_host, config.ingest_port)):
-        bind_host = "" if host == "0.0.0.0" else host
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.settimeout(0.5)
-        try:
-            free = probe.connect_ex((bind_host or "127.0.0.1", port)) != 0
-        finally:
-            probe.close()
-        print(f"{name:18} {host}:{port}  {'in use (bridge running?)' if not free else 'free'}")
+    url = watch_url()
+    health = AdapterClient(url).health()
+    print(f"listener           {url}  {'up' if health else 'DOWN'}")
+    if health:
+        watches = health.get("watches") or []
+        print(f"                   state={health.get('state')}  watches={len(watches)}"
+              f"  authorized={sum(1 for w in watches if w.get('authorized'))}")
+    else:
+        print("                   is the gateway running with this platform enabled?")
+        print(f"                   gateway.platforms.{PLATFORM_NAME}.enabled in ~/.hermes/config.yaml")
+
     print()
     print("no problems found" if problems == 0 else f"{problems} problem(s) to fix")
     return 0 if problems == 0 else 1
@@ -269,18 +304,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hermes-watch-bridge",
-        description="Bridge Hermes approvals, questions and live stats to a Wear OS watch.",
+        prog="hermes-watch",
+        description="Inspect the watch platform: stats, health, pairing.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve_parser = sub.add_parser("serve", help="run the bridge daemon")
-    serve_parser.add_argument("--host", help="watch bind address (default from config: 0.0.0.0)")
-    serve_parser.add_argument("--watch-port", type=int, help="watch WebSocket port (default 8787)")
-    serve_parser.add_argument("--ingest-port", type=int, help="plugin ingest port (default 8788)")
-    serve_parser.add_argument("--db", help="path to a state.db (default: $HERMES_HOME/state.db)")
-    serve_parser.add_argument("-v", "--verbose", action="store_true")
+    serve_parser = sub.add_parser("serve", help="(removed) how to run the listener now")
     serve_parser.set_defaults(func=cmd_serve)
 
     stats_parser = sub.add_parser("stats", help="print the stats the watch would show")
@@ -294,14 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument("--db")
     sessions_parser.set_defaults(func=cmd_sessions)
 
-    token_parser = sub.add_parser("token", help="show or rotate the pairing token")
-    token_parser.add_argument("--show", action="store_true", help="print the token in full")
-    token_parser.add_argument("--rotate", action="store_true", help="generate a new token")
-    token_parser.set_defaults(func=cmd_token)
-
-    status_parser = sub.add_parser("status", help="ask a running bridge for its health")
-    status_parser.add_argument("--url", help="ingest base url (default: from config)")
+    status_parser = sub.add_parser("status", help="ask the running listener for its health")
+    status_parser.add_argument("--url", help="listener base url (default: from config)")
     status_parser.set_defaults(func=cmd_status)
+
+    pairing_parser = sub.add_parser("pairing", help="show which watches are paired")
+    pairing_parser.set_defaults(func=cmd_pairing)
 
     doctor_parser = sub.add_parser("doctor", help="check the setup end to end")
     doctor_parser.set_defaults(func=cmd_doctor)

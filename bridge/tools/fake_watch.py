@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """A terminal stand-in for the Wear OS app.
 
-Useful when developing the bridge or the app without a watch on your wrist: it
-connects to the bridge's watch socket, prints every frame the watch would
-render, and (with ``--answer``) approves or denies the first approval it sees.
+Useful when developing the adapter or the app without a watch on your wrist: it
+connects to the watch listener, prints every frame the watch would render, can
+send a message (to trigger pairing), and answers the first approval it sees.
 
-    hermes-watch-bridge serve                       # terminal 1
-    python tools/fake_watch.py --token "$TOKEN"     # terminal 2
-    python tools/fake_watch.py --answer once        # answers and exits
+    # while the gateway (with the platform enabled) is running:
+    python tools/fake_watch.py --device my-watch
+    python tools/fake_watch.py --say hello          # trigger the pairing code
+    python tools/fake_watch.py --answer once --exit-after-answer
 
-Kept dependency-free apart from aiohttp, which the bridge already requires.
+The listener is part of the gateway now, so there is no daemon to start first.
+Depends only on aiohttp, which Hermes already ships.
 """
 
 from __future__ import annotations
@@ -25,52 +27,89 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_watch import protocol as p  # noqa: E402
-from hermes_watch.settings import load_config, load_token  # noqa: E402
+from hermes_watch.settings import load_config  # noqa: E402
 
 
 def render(frame: dict) -> str:
     kind = frame.get("type")
     if kind == p.S_HELLO:
-        return f"hello: bridge {frame['bridge_version']} protocol {frame['protocol']} profile {frame['profile']}"
+        return (
+            f"hello: watch adapter {frame.get('bridge_version')} protocol {frame.get('protocol')} "
+            f"profile {frame.get('profile')} authorized={frame.get('authorized')}"
+        )
     if kind == p.S_EVENT:
-        return f"EVENT {frame['event']:<22} {json.dumps(frame.get('payload', {}))[:110]}"
-    if kind == p.S_STATS:
-        live = frame.get("live", {})
+        event = frame.get("event")
+        payload = frame.get("payload", {})
+        if event == "message":
+            return f"MESSAGE {payload.get('text', '')}"
+        if event == p.E_APPROVAL_REQUESTED:
+            choices = payload.get("choices") or []
+            body = payload.get("payload") or {}
+            return (
+                f"APPROVAL {frame.get('id')}  {body.get('command') or ''}  "
+                f"choices={choices}  {payload.get('remaining_s')}s left"
+            )
+        if event == p.E_QUESTION_PENDING:
+            return f"QUESTION {frame.get('id')}  {json.dumps(payload)[:110]}"
+        return f"EVENT {event:<22} {json.dumps(payload)[:110]}"
+    if kind in (p.S_STATS, p.S_SNAPSHOT):
         parts = []
-        if "session" in frame and frame["session"]:
-            session = frame["session"]
+        session = frame.get("session")
+        if session:
             rate = session["tok_per_s"]
+            live = rate["live"]
             parts.append(
                 f"{session['title'] or session['id']}  "
-                f"{rate['live'] if rate['live'] is not None else '—'} tok/s  "
-                f"{session['tokens']['total']:,} tok  "
-                f"{session['elapsed_s']:.0f}s"
+                f"{live if live is not None else '—'} tok/s  "
+                f"{session['tokens']['total']:,} tok  {session['elapsed_s']:.0f}s"
             )
-        if frame.get("context"):
-            context = frame["context"]
+        context = frame.get("context")
+        if context:
             remaining = context["remaining_pct"]
-            parts.append(
-                f"context {remaining:.1f}% left" if remaining is not None else "context — (window unknown)"
-            )
+            parts.append(f"context {remaining:.1f}% left" if remaining is not None
+                         else "context — (window unknown)")
+        usage = frame.get("usage")
+        if usage:
+            parts.append(f"30d {usage['tokens']['total']:,} tok / {usage['session_count']} sessions")
+        live = frame.get("live") or {}
         if live:
             parts.append(f"state {live.get('agent_state')}")
-        return "STATS " + " | ".join(parts)
+        label = "SNAPSHOT" if kind == p.S_SNAPSHOT else "STATS"
+        return f"{label} " + " | ".join(parts)
     return f"{kind}: {json.dumps(frame)[:120]}"
 
 
 async def run(args: argparse.Namespace) -> int:
     config = load_config()
-    token = args.token or load_token() or ""
-    url = f"ws://{args.host}:{args.port}/v1/watch?token={token}&device={args.device}"
+    port = args.port or config.watch_port
+    url = f"http://{args.host}:{port}/watch"
     answered = False
+    sent = False
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(url, heartbeat=30) as ws:
-            print(f"connected to {url.split('token=')[0]}token=***")
+            print(f"connected to {url} as {args.device}")
+            await ws.send_str(
+                json.dumps({"v": 1, "type": p.C_HELLO, "device_id": args.device, "label": args.label})
+            )
+            if args.say:
+                await ws.send_str(json.dumps({"v": 1, "type": p.C_TEXT, "text": args.say}))
+                sent = True
             async for message in ws:
                 if message.type is not aiohttp.WSMsgType.TEXT:
                     break
                 frame = json.loads(message.data)
                 print(render(frame))
+                if (
+                    not sent
+                    and frame.get("type") == p.S_HELLO
+                    and args.pair
+                    and not frame.get("authorized")
+                ):
+                    # One message from an unknown device is what makes Hermes
+                    # answer with a pairing code.
+                    sent = True
+                    print("  -> sending a message to start pairing")
+                    await ws.send_str(json.dumps({"v": 1, "type": p.C_TEXT, "text": args.pair_message}))
                 if (
                     args.answer
                     and not answered
@@ -78,9 +117,10 @@ async def run(args: argparse.Namespace) -> int:
                     and frame.get("event") == p.E_APPROVAL_REQUESTED
                 ):
                     answered = True
-                    choice = args.answer
-                    print(f"  -> answering {frame['id']} with {choice!r}")
-                    await ws.send_str(json.dumps({"v": 1, "type": "answer", "id": frame["id"], "choice": choice}))
+                    print(f"  -> answering {frame['id']} with {args.answer!r}")
+                    await ws.send_str(
+                        json.dumps({"v": 1, "type": p.C_ANSWER, "id": frame["id"], "choice": args.answer})
+                    )
                     if args.exit_after_answer:
                         await asyncio.sleep(0.5)
                         return 0
@@ -90,14 +130,15 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=None, help="default: watch_port from bridge config")
-    parser.add_argument("--token", help="pairing token (default: from $HERMES_HOME/hermes-watch/token)")
-    parser.add_argument("--device", default="fake-watch")
+    parser.add_argument("--port", type=int, default=None, help="default: watch_port from config")
+    parser.add_argument("--device", default="fake-watch", help="stable device id (pairing keys on this)")
+    parser.add_argument("--label", default="Fake Watch", help="human name shown on the host")
+    parser.add_argument("--say", help="send this message on connect")
+    parser.add_argument("--pair", action="store_true", help="send a message when the listener says unpaired")
+    parser.add_argument("--pair-message", default="hello", help="message used by --pair")
     parser.add_argument("--answer", choices=p.APPROVAL_CHOICES, help="answer the first approval with this choice")
     parser.add_argument("--exit-after-answer", action="store_true")
     args = parser.parse_args()
-    if args.port is None:
-        args.port = load_config().watch_port
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:

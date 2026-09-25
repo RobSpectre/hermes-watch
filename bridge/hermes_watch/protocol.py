@@ -28,6 +28,10 @@ C_HELLO = "hello"
 C_ANSWER = "answer"
 C_STATS_REQUEST = "stats.request"
 C_PONG = "pong"
+#: A message from the watch. This is what makes the watch a platform rather than
+#: a readout: it goes through the normal ingress, so Hermes' pairing flow can
+#: answer an unknown device with a code, and a paired one can start a session.
+C_TEXT = "text"
 
 # --- server -> client -------------------------------------------------------
 
@@ -110,6 +114,10 @@ def validation_error(frame: dict) -> Optional[str]:
         choice = frame.get("choice")
         if not isinstance(choice, str) or choice not in APPROVAL_CHOICES + ("reply", "cancel"):
             return f"unsupported choice: {choice!r}"
+    elif kind == C_TEXT:
+        text = frame.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return "text frame has no text"
     return None
 
 

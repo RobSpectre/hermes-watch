@@ -1,17 +1,23 @@
-"""Hermes Watch: bridge Hermes approvals, questions and live stats to Wear OS.
+"""Hermes Watch: approvals, questions and live stats on a Wear OS watch.
 
-Two halves in one package:
+The watch is a Hermes gateway platform, not a sidecar. Three pieces, each with
+one job:
 
-* :mod:`hermes_watch.daemon` + :mod:`hermes_watch.hub` -- the bridge daemon that
-  holds watch connections, blocking approvals, and the stats snapshot.
-* :mod:`hermes_watch.plugin` -- the Hermes plugin that feeds the daemon from
-  inside a live agent process.
+* :mod:`hermes_watch.platform` -- the adapter. Hosts the watch WebSocket, pushes
+  stats, renders approval buttons and question chips, and slides its prompts
+  into Hermes' own prompt tokens and choice sets.
+* :mod:`hermes_watch.plugin` -- the Hermes plugin. Reports lifecycle events and
+  the exact provider-call measurements, and routes approvals to the watch for
+  sessions that have no adapter of their own (a CLI session).
+* :mod:`hermes_watch.stats` -- the readout. Reads the session store and the
+  model metadata; never invents a number it did not measure.
 
-The wire contract is :mod:`hermes_watch.protocol`, documented in
-``docs/protocol.md``. The Wear OS client in ``watch/`` implements the same
+:mod:`hermes_watch.live` is where the first two meet when they share a process.
+:mod:`hermes_watch.protocol` is the wire contract, documented in
+``docs/protocol.md``; the Wear OS client in ``watch/`` implements the same
 contract in Kotlin.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]

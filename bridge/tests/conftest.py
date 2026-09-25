@@ -8,11 +8,37 @@ authoritative schema reference.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
 import pytest
+
+
+def _add_hermes_to_path() -> bool:
+    """Put the local Hermes installation on ``sys.path`` when there is one.
+
+    The adapter subclasses ``BasePlatformAdapter``, so its tests need Hermes
+    importable. Where Hermes is absent they skip rather than fail: the adapter
+    is meaningless without Hermes, and a green run on a machine that has neither
+    would prove nothing.
+    """
+    candidates: list[Path] = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        candidates.append(Path(env_home) / "hermes-agent")
+    candidates.append(Path.home() / ".hermes" / "hermes-agent")
+    for candidate in candidates:
+        if (candidate / "gateway" / "platforms" / "base.py").is_file():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            return True
+    return False
+
+
+HERMES_AVAILABLE = _add_hermes_to_path()
 
 SESSIONS_DDL = """
 CREATE TABLE IF NOT EXISTS sessions (
