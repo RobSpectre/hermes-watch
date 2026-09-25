@@ -23,6 +23,12 @@ object HermesColors {
 
     /** Nothing to report. */
     val Muted = Color(0xFF9AA4B2)
+
+    /** Body text on the app's dark background. */
+    val Text = Color(0xFFE6EAF2)
+
+    /** Background of a text field. */
+    val Field = Color(0xFF232A38)
 }
 
 @Composable

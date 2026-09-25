@@ -1,19 +1,25 @@
 package com.nousresearch.hermeswatch.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -22,7 +28,6 @@ import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.Button
 import androidx.wear.compose.material.MaterialTheme
-import androidx.wear.compose.material.TextField
 import androidx.wear.compose.material.PositionIndicator
 import androidx.wear.compose.material.Scaffold
 import androidx.wear.compose.material.Text
@@ -33,6 +38,11 @@ import com.nousresearch.hermeswatch.data.BridgeSettings
  * Pairing: host, port, token. Three fields is already a lot for a watch, so the
  * layout is one column, big targets, and the port pre-filled with the bridge's
  * documented default.
+ *
+ * Text input uses Compose foundation's `BasicTextField` rather than a Material
+ * wear text field: `androidx.wear.compose.material` ships no `TextField` at all
+ * (checked against the published artifact), and pulling in a Material3
+ * dependency for three fields would be the tail wagging the dog.
  */
 @Composable
 fun PairingScreen(
@@ -63,33 +73,30 @@ fun PairingScreen(
                 )
             }
             item {
-                TextField(
+                PairingField(
+                    label = "Bridge host",
                     value = host,
                     onValueChange = { host = it },
-                    label = { Text("Bridge host") },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth(),
                 )
             }
             item {
-                TextField(
+                PairingField(
+                    label = "Port",
                     value = port,
                     onValueChange = { port = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Port") },
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Number,
                         imeAction = ImeAction.Next,
                     ),
-                    modifier = Modifier.fillMaxWidth(),
                 )
             }
             item {
-                TextField(
+                PairingField(
+                    label = "Pairing token",
                     value = token,
                     onValueChange = { token = it.trim() },
-                    label = { Text("Pairing token") },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                    modifier = Modifier.fillMaxWidth(),
                 )
             }
             item {
@@ -110,5 +117,46 @@ fun PairingScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PairingField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    keyboardOptions: KeyboardOptions,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(text = label, style = MaterialTheme.typography.caption1)
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            keyboardOptions = keyboardOptions,
+            textStyle = TextStyle(
+                color = HermesColors.Text,
+                textAlign = TextAlign.Center,
+                fontSize = MaterialTheme.typography.body1.fontSize,
+            ),
+            cursorBrush = SolidColor(HermesColors.Active),
+            modifier = Modifier.fillMaxWidth(),
+            decorationBox = { innerTextField ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(HermesColors.Field)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    innerTextField()
+                }
+            },
+        )
     }
 }
