@@ -1,16 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The bridge speaks ws:// on the local network, so cleartext has to be permitted
-  for private ranges only. Everything else stays TLS-only: a bridge reachable
-  over the public internet should be behind TLS or a tunnel, not this exception.
+  Cleartext is permitted in general, because the watch talks to a gateway whose
+  address the user types on the watch.
+
+  An earlier version of this file claimed to permit "private ranges only" and
+  listed localhost, 127.0.0.1 and the emulator alias 10.0.2.2. A network
+  security config cannot express a CIDR range, so in practice *every* real LAN
+  address was refused:
+
+      CLEARTEXT communication to 192.168.1.96 not permitted by network security policy
+
+  which meant the app could not connect to a gateway on a network at all.
+  Pinning addresses individually is not possible either: the host is whatever
+  the user entered.
+
+  The app's only network traffic is that one socket, so this exception is narrow
+  in practice rather than a general hole. It is also deliberate rather than
+  temporary: the client builds ``ws://`` unconditionally, so serving the gateway
+  over TLS would need a client change first. Until then, run the gateway on a
+  network you trust.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-
-    <domain-config cleartextTrafficPermitted="true">
-        <!-- RFC1918 private ranges, in the literal forms Android accepts. -->
-        <domain includeSubdomains="false">localhost</domain>
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">10.0.2.2</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

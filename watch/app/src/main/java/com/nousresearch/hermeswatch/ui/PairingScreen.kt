@@ -35,9 +35,13 @@ import androidx.wear.compose.material.TimeText
 import com.nousresearch.hermeswatch.data.BridgeSettings
 
 /**
- * Pairing: host, port, token. Three fields is already a lot for a watch, so the
- * layout is one column, big targets, and the port pre-filled with the bridge's
- * documented default.
+ * Pairing: host, port, and a token field kept only for wire compatibility.
+ *
+ * The token is a leftover of the pre-gateway design: access is granted by
+ * Hermes' pairing store now, so the field is labelled unused, not validated, and
+ * a watch can be paired with host and port alone. Three fields is already a lot
+ * for a watch, so the layout is one column, big targets, and the port pre-filled
+ * with the documented default.
  *
  * Text input uses Compose foundation's `BasicTextField` rather than a Material
  * wear text field: `androidx.wear.compose.material` ships no `TextField` at all
@@ -53,7 +57,9 @@ fun PairingScreen(
     var port by rememberSaveable { mutableStateOf(initial.port.toString()) }
     var token by rememberSaveable { mutableStateOf(initial.token) }
     val listState = rememberScalingLazyListState()
-    val valid = host.isNotBlank() && token.isNotBlank() && (port.toIntOrNull() ?: 0) in 1..65535
+    // No token requirement: see BridgeSettings.isComplete. Pairing happens on
+    // the host, after the watch has said hello.
+    val valid = host.isNotBlank() && (port.toIntOrNull() ?: 0) in 1..65535
 
     Scaffold(
         timeText = { TimeText() },
@@ -93,7 +99,7 @@ fun PairingScreen(
             }
             item {
                 PairingField(
-                    label = "Pairing token",
+                    label = "Pairing token (unused)",
                     value = token,
                     onValueChange = { token = it.trim() },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
@@ -101,7 +107,8 @@ fun PairingScreen(
             }
             item {
                 Text(
-                    text = "On the Hermes machine: hermes-watch-bridge token --show",
+                    text = "Leave the token blank. Then on the Hermes host: " +
+                        "hermes pairing approve pixel_watch <code>",
                     style = MaterialTheme.typography.caption1,
                     textAlign = TextAlign.Center,
                 )

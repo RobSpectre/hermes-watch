@@ -16,7 +16,16 @@ data class BridgeSettings(
     val port: Int = DEFAULT_PORT,
     val token: String = "",
 ) {
-    val isComplete: Boolean get() = host.isNotBlank() && token.isNotBlank() && port in 1..65535
+    /**
+     * Whether there is enough here to open a socket.
+     *
+     * The token is deliberately *not* required: the bridge no longer keeps a
+     * shared secret. Access is granted by Hermes' own pairing store, so a watch
+     * with the right host and port connects, says hello, and is told it is
+     * unpaired until someone runs `hermes pairing approve pixel_watch <code>` on
+     * the host. Requiring a token here would block that first hello.
+     */
+    val isComplete: Boolean get() = host.isNotBlank() && port in 1..65535
 
     companion object {
         const val DEFAULT_PORT = 8787
