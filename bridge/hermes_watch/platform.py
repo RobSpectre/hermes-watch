@@ -731,6 +731,14 @@ class HermesWatchAdapter(BasePlatformAdapter):
             choice = await asyncio.wait_for(future, timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             self._pending.pop(pending.id, None)
+            # Nobody answered. The wait is over even though the request was
+            # not: without this the listener sat at waiting_approval forever,
+            # telling the wrist the agent was blocked when it was not (seen
+            # live -- healthz showed waiting_approval with an empty pending
+            # list, minutes after the host had timed out).
+            if not self._pending:
+                self._resume_after_wait()
+            await self._broadcast_stats()
             return web.json_response({"ok": True, "choice": None, "source": "timeout"}, status=200)
         finally:
             self._pending.pop(pending.id, None)

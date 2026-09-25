@@ -674,6 +674,31 @@ async def test_notify_pushes_text_to_the_watch(isolated_home):
             assert frame["payload"]["text"] == "Hermes: build finished"
 
 
+async def test_a_prompt_that_times_out_still_returns_to_idle(isolated_home):
+    """The wait ends when the deadline does, even with no answer.
+
+    Seen live: after the host's approval timeout fired, healthz reported
+    waiting_approval with an empty pending list -- the listener claiming the
+    agent was blocked when nothing was pending at all.
+    """
+    async with rig(isolated_home, allow_all_devices=True, approval_timeout_s=1) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)                            # registered, so it can be asked
+            bus.observe(p.E_TURN_STARTED, {"turn_id": "t1"})   # a working state to restore
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{port}/event",
+                    json={"event": p.E_APPROVAL_REQUESTED, "id": "apv_slow",
+                          "choices": ["once", "deny"], "timeout": 0.4,
+                          "payload": {"command": "echo hi"}},
+                ) as response:
+                    body = await response.json()
+        assert body.get("choice") is None
+        assert body.get("source") == "timeout"
+        assert adapter._pending == {}
+        assert adapter._state == "thinking", "an unanswered prompt left the wait state behind"
+
+
 async def test_turn_finished_stays_silent_by_default(isolated_home):
     """Off unless asked: one buzz per turn is noise in a busy gateway."""
     async with rig(isolated_home, allow_all_devices=True) as (_, port):
