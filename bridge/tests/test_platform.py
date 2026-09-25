@@ -548,6 +548,57 @@ async def test_send_delivers_to_a_connected_watch(isolated_home):
             assert frame["payload"]["text"] == "pairing code: ABCD1234"
 
 
+async def test_the_pairing_code_reaches_an_unpaired_watch(isolated_home):
+    """The one message an unpaired watch must get. Refusing it broke onboarding.
+
+    Hermes' unauthorized-DM path answers a stranger with a pairing code by
+    calling ``send(source.chat_id, reply)`` -- to a device that is, by
+    definition, not authorized yet.
+    """
+    async with rig(isolated_home, allow_all_devices=False) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)  # hello itself resolves to authorized=False
+            assert adapter._links["dev-1"].authorized is False
+            result = await adapter.send("dev-1", "Pairing code: ABCD1234")
+            assert result.success is True, "an unpaired watch was never told its code"
+            frame = await read_until(ws, lambda f: f.get("event") == "message")
+            assert frame is not None
+            assert frame["payload"]["text"] == "Pairing code: ABCD1234"
+
+
+async def test_a_revoked_watch_stops_receiving_messages(isolated_home, monkeypatch):
+    """`revoke` has to mean something: paired once, then un-approved."""
+    from hermes_watch import platform as platform_module
+
+    async with rig(isolated_home, allow_all_devices=True) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            assert (await adapter.send("dev-1", "before")).success is True
+
+            # The owner revokes the device: the store now says no, and the
+            # explicit allow-all escape hatch is switched off too.
+            monkeypatch.setattr(platform_module.HermesWatchAdapter, "_allow_all", False, raising=False)
+            adapter._allow_all = False
+            adapter._allowed_devices = set()
+            adapter._approval_cache.clear()
+            monkeypatch.setattr(adapter, "_read_pairing_store", lambda device_id: False)
+
+            # Authorization is re-read per delivery, so this bites immediately
+            # rather than at the next reconnect.
+            result = await adapter.send("dev-1", "after")
+            assert result.success is False, "a revoked watch still received a message"
+
+
+async def test_a_broadcast_never_reaches_an_unpaired_watch(isolated_home):
+    """`send` with no chat id is for the household, not for strangers."""
+    async with rig(isolated_home, allow_all_devices=False) as (adapter, port):
+        async with watch(port) as ws:
+            await say_hello(ws)
+            result = await adapter.send("", "gateway notice")
+            assert result.success is False
+            assert await read_until(ws, lambda f: f.get("event") == "message", timeout=0.5) is None
+
+
 async def test_ingest_token_is_enforced_when_configured(isolated_home):
     async with rig(isolated_home, allow_all_devices=True, ingest_token="s3cret") as (adapter, port):
         async with aiohttp.ClientSession() as session:

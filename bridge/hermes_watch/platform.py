@@ -174,6 +174,10 @@ class HermesWatchAdapter(BasePlatformAdapter):
         self._links: dict[str, _WatchLink] = {}
         self._pending: dict[str, _Pending] = {}
         self._approval_cache: dict[str, tuple[float, bool]] = {}
+        #: Devices that have been authorized at least once. A revoke is meant to
+        #: stop delivery, and "never paired" has to stay distinguishable from
+        #: "paired then revoked" for that to work -- see _delivery_targets.
+        self._ever_authorized: set[str] = set()
 
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -294,7 +298,7 @@ class HermesWatchAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata=None) -> SendResult:
         """Push a message to the watch (or to every connected watch)."""
         frame = p.envelope(p.S_EVENT, event="message", payload={"text": str(content)})
-        targets = self._targets(chat_id)
+        targets = await self._delivery_targets(chat_id)
         if not targets:
             return SendResult(success=False, error="no watch connected", retryable=True, error_kind="transient")
         delivered = 0
@@ -843,12 +847,48 @@ class HermesWatchAdapter(BasePlatformAdapter):
 
     # -- helpers -------------------------------------------------------------
 
-    def _targets(self, chat_id: str) -> list[_WatchLink]:
+    async def _delivery_targets(self, chat_id: str) -> list[_WatchLink]:
+        """Who may receive this message.
+
+        The split here is deliberate, and both halves were learned the hard way:
+
+        * An **exact** chat id reaches its device even when that device is not
+          paired. The pairing code is addressed that way, and refusing it made
+          onboarding impossible: the one message an unpaired watch must receive
+          was the one message the adapter dropped. It is safe because an
+          unpaired sender never gets a session, so no agent output can be aimed
+          at it -- only the runner's own pairing code or refusal notice is.
+        * A device that was paired and has since been **revoked** gets nothing.
+          That is what a revoke is for, which is why "never paired" and "paired
+          then revoked" are told apart rather than both being "not authorized".
+        * A **broadcast** (no chat id, or ``all``) goes to paired devices only,
+          so a notice meant for the household never lands on a stranger's watch.
+
+        Authorization is re-read here rather than trusted from hello time, so
+        revoking a device takes effect as messages flow instead of at its next
+        reconnect.
+        """
         if chat_id and chat_id not in ("", "all"):
             link = self._links.get(chat_id)
-            if link is not None and link.authorized:
+            if link is None:
+                return []
+            device_id = link.device_id or chat_id
+            link.authorized = await self._is_authorized(device_id)
+            if link.authorized:
                 return [link]
-        return [link for link in self._links.values() if link.authorized]
+            if device_id in self._ever_authorized:
+                log.info("[%s] withholding a message for revoked device %s", PLATFORM_NAME, device_id)
+                return []
+            return [link]
+
+        targets: list[_WatchLink] = []
+        for link in self._links.values():
+            if not link.device_id:
+                continue
+            link.authorized = await self._is_authorized(link.device_id)
+            if link.authorized:
+                targets.append(link)
+        return targets
 
     def _request_id_from(self, metadata: Optional[dict]) -> Optional[str]:
         for key in ("request_id", "approval_request_id", "id"):
@@ -864,15 +904,20 @@ class HermesWatchAdapter(BasePlatformAdapter):
         in both directions so a locked-down or a zero-config rig both work.
         """
         if self._allow_all:
+            self._ever_authorized.add(device_id)
             return True
         if device_id in self._allowed_devices:
+            self._ever_authorized.add(device_id)
             return True
         now = time.time()
         cached = self._approval_cache.get(device_id)
         if cached is not None and (now - cached[0]) < PAIRING_CACHE_S:
-            return cached[1]
-        approved = await asyncio.to_thread(self._read_pairing_store, device_id)
-        self._approval_cache[device_id] = (now, approved)
+            approved = cached[1]
+        else:
+            approved = await asyncio.to_thread(self._read_pairing_store, device_id)
+            self._approval_cache[device_id] = (now, approved)
+        if approved:
+            self._ever_authorized.add(device_id)
         return approved
 
     def _read_pairing_store(self, device_id: str) -> bool:
