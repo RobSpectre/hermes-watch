@@ -122,8 +122,11 @@ class WatchLinkService : Service() {
 
                     // The bridge redelivers open requests in every snapshot, so
                     // a watch that reconnects mid-approval re-posts the prompt.
-                    snapshot.pendingApprovals
-                        .firstOrNull { it.kind == "approval" }
+                    // Prefer one we can answer: a request presented on another
+                    // surface also lands here, without choices, and posting that
+                    // over the actionable one leaves a card with no buttons.
+                    val approvals = snapshot.pendingApprovals.filter { it.kind == "approval" }
+                    (approvals.firstOrNull { it.choices.isNotEmpty() } ?: approvals.firstOrNull())
                         ?.let(notifier::showApproval)
                         ?: notifier.clearApproval()
                 }

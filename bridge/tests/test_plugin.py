@@ -426,6 +426,30 @@ def test_register_declares_addressing_and_standalone_delivery():
     assert platform["cron_deliver_env_var"] == "HERMES_WATCH_HOME_CHANNEL"
 
 
+def test_the_hook_does_not_duplicate_a_prompt_our_transport_is_presenting(plugin):
+    """One approval, one card -- and the card must be the answerable one.
+
+    Seen live: the hook posted a choice-less copy alongside the transport's
+    actionable one, so the listener held two pendings and the watch showed the
+    one with no buttons.
+    """
+    plugin.on_pre_approval_request(
+        command="rm -rf ~/build/cache", description="recursive delete",
+        pattern_key="rm_rf", surface="transport:pixel-watch", turn_id="t1",
+    )
+    assert plugin.client.posts == []
+
+
+def test_the_hook_still_reports_approvals_shown_elsewhere(plugin):
+    """A terminal or gateway prompt must still reach the wrist."""
+    plugin.on_pre_approval_request(
+        command="rm -rf ~/build/cache", description="recursive delete",
+        pattern_key="rm_rf", surface="cli", turn_id="t1",
+    )
+    events = [payload for name, payload in plugin.client.posts if name == p.E_APPROVAL_REQUESTED]
+    assert events and events[0]["command"] == "rm -rf ~/build/cache"
+
+
 def test_clip_leaves_short_text_alone():
     assert _clip("short") == "short"
     assert len(_clip("x" * 500, 100)) == 100

@@ -301,14 +301,24 @@ class WatchPlugin:
         The transport above only runs when it is the selected transport; this
         hook fires either way, so a gateway approval (or a terminal one) still
         shows up on the wrist.
+
+        But when *this* transport is the one presenting the request, posting
+        here duplicates it: the hook's copy has no choices (it is not the thing
+        asking), so the listener ends up holding two pendings for one approval
+        and the watch is told about the unanswerable one. Seen live -- the
+        notification arrived with no buttons at all.
         """
+        surface = str(kw.get("surface") or "")
+        if surface == f"transport:{TRANSPORT_NAME}":
+            # Our own transport is asking; it posts the actionable prompt.
+            return
         self.observe(
             p.E_APPROVAL_REQUESTED,
             id=f"apv_{str(kw.get('turn_id') or '')[:12]}",
             command=_clip(kw.get("command"), 400),
             description=_clip(kw.get("description")),
             pattern_key=kw.get("pattern_key"),
-            surface=kw.get("surface"),
+            surface=surface,
             transport=TRANSPORT_NAME,
         )
 
